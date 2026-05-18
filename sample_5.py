@@ -3,6 +3,7 @@ import logging
 import re
 from typing import Any, Optional, Iterable
 from traceback import format_exc
+from types import SimpleNamespace
 
 import asyncssh
 
@@ -352,8 +353,162 @@ async def _handle_interactive_login_banner(
     await asyncio.sleep(0.3)
 
 
+class _DeviceShellSession:
+    """
+    Keep one interactive CLI shell open for the whole device session.
+
+    Many network devices do not behave like Linux SSH servers. They may reject
+    SSH exec requests, or close the SSH transport after an exec-style command.
+    This wrapper runs terminal setup and show commands through one persistent
+    shell channel instead.
+    """
+
+    def __init__(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        ctx: dict[str, Any],
+    ) -> None:
+        self.conn = conn
+        self.ctx = ctx
+        self.proc = None
+
+    def is_closed(self) -> bool:
+        return self.conn.is_closed()
+
+    async def open(self, timeout: int = 12) -> None:
+        device_ip = self.ctx.get("device_ip", "unknown")
+        self.proc = await self.conn.create_process(term_type="vt100")
+        await asyncio.sleep(0.5)
+        await self._read_until_prompt(
+            timeout=timeout,
+            allow_banner_responses=True,
+            send_initial_newline=True,
+        )
+        logger.info(f"[{device_ip}] Interactive shell ready")
+
+    async def run(self, cmd: str, check: bool = False):
+        del check
+        stdout = await self.run_command(cmd)
+        return SimpleNamespace(stdout=stdout, stderr="", exit_status=0)
+
+    async def run_command(self, cmd: str, timeout: int = 60) -> str:
+        if self.proc is None:
+            raise ConnectionError("Interactive shell is not open")
+        if self.conn.is_closed():
+            raise ConnectionError("SSH connection is closed")
+
+        cmd = cmd.strip()
+        if not cmd:
+            return ""
+
+        self.proc.stdin.write(cmd + "\n")
+        await self.proc.stdin.drain()
+
+        output = await self._read_until_prompt(
+            timeout=timeout,
+            allow_banner_responses=False,
+            send_initial_newline=False,
+        )
+        return self._clean_command_output(cmd, output)
+
+    async def _read_until_prompt(
+        self,
+        timeout: int,
+        allow_banner_responses: bool,
+        send_initial_newline: bool,
+    ) -> str:
+        if self.proc is None:
+            raise ConnectionError("Interactive shell is not open")
+
+        device_ip = self.ctx.get("device_ip", "unknown")
+        buf = ""
+        empty_reads = 0
+        start = asyncio.get_event_loop().time()
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > timeout:
+                raise asyncio.TimeoutError(
+                    f"Timed out waiting for prompt after {timeout}s"
+                )
+
+            if self.conn.is_closed():
+                raise ConnectionError("SSH connection closed while waiting for prompt")
+
+            try:
+                chunk = await asyncio.wait_for(
+                    self.proc.stdout.read(1024),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                chunk = ""
+
+            if not chunk:
+                empty_reads += 1
+                if send_initial_newline and empty_reads == 2:
+                    self.proc.stdin.write("\n")
+                    await self.proc.stdin.drain()
+                await asyncio.sleep(0.1)
+                continue
+
+            empty_reads = 0
+            buf += chunk
+            if len(buf) > 20000:
+                buf = buf[-20000:]
+
+            buf_lower = buf.lower()
+
+            if allow_banner_responses and any(p in buf_lower for p in _ACCEPT_A_PATTERNS):
+                logger.info(f"[{device_ip}] Detected accept banner, sending 'a'")
+                self.proc.stdin.write("a\n")
+                await self.proc.stdin.drain()
+                await asyncio.sleep(0.5)
+                buf = ""
+                continue
+
+            if allow_banner_responses and any(p in buf_lower for p in _PRESS_ANY_KEY_PATTERNS):
+                logger.info(f"[{device_ip}] Detected press-any-key banner, sending ENTER")
+                self.proc.stdin.write("\n")
+                await self.proc.stdin.drain()
+                await asyncio.sleep(0.5)
+                buf = ""
+                continue
+
+            if _PROMPT_RE.search(buf):
+                return buf
+
+    @staticmethod
+    def _clean_command_output(cmd: str, output: str) -> str:
+        lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+        if lines and lines[0].strip() == cmd.strip():
+            lines = lines[1:]
+
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        if lines and _PROMPT_RE.search("\n" + lines[-1]):
+            lines = lines[:-1]
+
+        return "\n".join(lines)
+
+    def close(self) -> None:
+        try:
+            if self.proc is not None:
+                self.proc.close()
+        except Exception:
+            pass
+        self.conn.close()
+
+    async def wait_closed(self) -> None:
+        await self.conn.wait_closed()
+
+
 async def _disable_paging(
-    conn: asyncssh.SSHClientConnection,
+    conn: Any,
     ctx: dict[str, Any],
     retries: int = 2,
 ) -> bool:
@@ -392,8 +547,8 @@ async def _connect_device(
     bastion_conn: asyncssh.SSHClientConnection,
     ctx: dict[str, Any],
     connect_timeout: int,
-) -> asyncssh.SSHClientConnection:
-    """Open an SSH tunnel to the device through the bastion + handle interactive banners."""
+) -> _DeviceShellSession:
+    """Open an SSH tunnel to the device through the bastion and start an interactive CLI shell."""
     conn = await asyncssh.connect(
         host=ctx["device_ip"],
         port=int(ctx["port"]),
@@ -407,32 +562,18 @@ async def _connect_device(
 
     logger.info(f"[{ctx['device_ip']}] SSH authenticated")
 
-    # First try normal command mode. This avoids opening and closing a temporary
-    # shell on devices that are already ready; on some network devices, closing
-    # that shell closes the whole SSH session.
-    if await _disable_paging(conn, ctx, retries=1):
-        return conn
-
-    logger.info(
-        f"[{ctx['device_ip']}] Command mode not ready, handling login banner"
-    )
-
-    await _handle_interactive_login_banner(
-        conn,
-        ctx,
+    session = _DeviceShellSession(conn, ctx)
+    await session.open(
         timeout=min(12, max(6, connect_timeout)),
     )
 
-    if conn.is_closed():
-        raise ConnectionError("SSH connection closed after banner handling")
+    await _disable_paging(session, ctx, retries=2)
 
-    await _disable_paging(conn, ctx, retries=2)
-
-    return conn
+    return session
 
 
 async def _run_command(
-    conn: asyncssh.SSHClientConnection,
+    conn: Any,
     cmd: str,
     timeout: int = 60,
 ) -> str:
@@ -440,6 +581,9 @@ async def _run_command(
     cmd = cmd.strip()
     if not cmd:
         return ""
+
+    if hasattr(conn, "run_command"):
+        return await conn.run_command(cmd, timeout=timeout)
 
     r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=timeout)
     output = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
@@ -452,7 +596,7 @@ async def _run_command(
 
 
 async def _run_multiline_commands(
-    conn: asyncssh.SSHClientConnection,
+    conn: Any,
     commands: list[str],
     timeout: int = 60,
 ) -> str:
@@ -469,7 +613,7 @@ async def _run_multiline_commands(
 # ---------------------------------------------------------------------------
 
 async def _execute_checks(
-    conn: asyncssh.SSHClientConnection,
+    conn: Any,
     ctx: dict[str, Any],
     read_timeout: int = 60,
     max_retries: int = 3,
@@ -669,7 +813,7 @@ async def _device_worker(
             return _build_only_ping_result(ctx)
 
         # 3) SSH connect via bastion tunnel.
-        device_conn: asyncssh.SSHClientConnection | None = None
+        device_conn: Any | None = None
         try:
             # Important: do not wrap _connect_device() in wait_for(connect_timeout).
             # _connect_device() includes SSH auth, banner handling, and terminal setup.
