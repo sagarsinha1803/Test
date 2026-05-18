@@ -237,6 +237,14 @@ _PROMPT_RE = re.compile(
     r"(?m)(?:^|\n).{0,120}(\s+\(.*\))?\s*[#>$]\s*$"
 )
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
+
+_CONTROL_CHARS_RE = re.compile(
+    r"[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]"
+)
+
 _ACCEPT_A_PATTERNS = [
     "press 'a' to accept",
     "press a to accept",
@@ -377,7 +385,13 @@ class _DeviceShellSession:
 
     async def open(self, timeout: int = 12) -> None:
         device_ip = self.ctx.get("device_ip", "unknown")
-        self.proc = await self.conn.create_process(term_type="vt100")
+        try:
+            self.proc = await self.conn.create_process(
+                term_type="vt100",
+                term_size=(511, 1000),
+            )
+        except TypeError:
+            self.proc = await self.conn.create_process(term_type="vt100")
         await asyncio.sleep(0.5)
         await self._read_until_prompt(
             timeout=timeout,
@@ -479,12 +493,13 @@ class _DeviceShellSession:
 
     @staticmethod
     def _clean_command_output(cmd: str, output: str) -> str:
+        output = _DeviceShellSession._strip_terminal_control(output)
         lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
 
         while lines and not lines[0].strip():
             lines.pop(0)
 
-        if lines and lines[0].strip() == cmd.strip():
+        while lines and _DeviceShellSession._is_echo_line(lines[0], cmd):
             lines = lines[1:]
 
         while lines and not lines[-1].strip():
@@ -494,6 +509,36 @@ class _DeviceShellSession:
             lines = lines[:-1]
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _strip_terminal_control(output: str) -> str:
+        output = _ANSI_ESCAPE_RE.sub("", output)
+
+        chars: list[str] = []
+        for ch in output:
+            if ch == "\b":
+                if chars and chars[-1] not in "\r\n":
+                    chars.pop()
+                continue
+            chars.append(ch)
+
+        output = "".join(chars)
+        return _CONTROL_CHARS_RE.sub("", output)
+
+    @staticmethod
+    def _is_echo_line(line: str, cmd: str) -> bool:
+        line_norm = re.sub(r"\s+", " ", line.strip())
+        cmd_norm = re.sub(r"\s+", " ", cmd.strip())
+
+        if not line_norm:
+            return True
+        if line_norm == cmd_norm:
+            return True
+        if line_norm.startswith(cmd_norm[: min(len(cmd_norm), 30)]):
+            return True
+        if cmd_norm.startswith(line_norm) and len(line_norm) >= 8:
+            return True
+        return False
 
     def close(self) -> None:
         try:
@@ -520,6 +565,18 @@ async def _disable_paging(
     itself closes, because the caller must reconnect in that case.
     """
     device_ip = ctx["device_ip"]
+
+    try:
+        await asyncio.wait_for(
+            conn.run("terminal width 511", check=False),
+            timeout=5,
+        )
+    except Exception as ex:
+        logger.debug(f"[{device_ip}] terminal width 511 skipped/failed: {ex}")
+        if conn.is_closed():
+            raise ConnectionError(
+                f"SSH connection closed during terminal width setup: {ex}"
+            )
 
     for attempt in range(retries):
         try:
