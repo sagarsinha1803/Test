@@ -352,6 +352,42 @@ async def _handle_interactive_login_banner(
     await asyncio.sleep(0.3)
 
 
+async def _disable_paging(
+    conn: asyncssh.SSHClientConnection,
+    ctx: dict[str, Any],
+    retries: int = 2,
+) -> bool:
+    """
+    Disable paging if the device accepts Cisco-style terminal setup.
+
+    Returns True when the command completed. Returns False when it timed out or
+    failed while the SSH connection stayed open. Raises if the SSH connection
+    itself closes, because the caller must reconnect in that case.
+    """
+    device_ip = ctx["device_ip"]
+
+    for attempt in range(retries):
+        try:
+            await asyncio.wait_for(
+                conn.run("terminal length 0", check=False),
+                timeout=5,
+            )
+            return True
+        except Exception as ex:
+            logger.warning(
+                f"[{device_ip}] terminal length 0 failed "
+                f"attempt {attempt + 1}: {ex}"
+            )
+            if conn.is_closed():
+                raise ConnectionError(
+                    f"SSH connection closed during terminal setup: {ex}"
+                )
+            if attempt + 1 < retries:
+                await asyncio.sleep(1)
+
+    return False
+
+
 async def _connect_device(
     bastion_conn: asyncssh.SSHClientConnection,
     ctx: dict[str, Any],
@@ -369,33 +405,28 @@ async def _connect_device(
         # preferred_algs={ ... }  # enable only if you must for legacy gear
     )
 
-    logger.info(f"[{ctx['device_ip']}] SSH authenticated, handling banner")
+    logger.info(f"[{ctx['device_ip']}] SSH authenticated")
 
-    # Do not wrap this whole function in asyncio.wait_for(connect_timeout).
-    # SSH connect has its own timeout; banner handling and terminal setup need
-    # their own small windows after authentication succeeds.
+    # First try normal command mode. This avoids opening and closing a temporary
+    # shell on devices that are already ready; on some network devices, closing
+    # that shell closes the whole SSH session.
+    if await _disable_paging(conn, ctx, retries=1):
+        return conn
+
+    logger.info(
+        f"[{ctx['device_ip']}] Command mode not ready, handling login banner"
+    )
+
     await _handle_interactive_login_banner(
         conn,
         ctx,
         timeout=min(12, max(6, connect_timeout)),
     )
 
-    # Disable paging (best-effort). First attempt may still hit a lingering
-    # banner prompt on some devices, so retry once.
-    for attempt in range(2):
-        try:
-            await asyncio.wait_for(
-                conn.run("terminal length 0", check=False),
-                timeout=5,
-            )
-            break
-        except Exception as ex:
-            logger.warning(
-                f"[{ctx['device_ip']}] terminal length 0 failed "
-                f"attempt {attempt + 1}: {ex}"
-            )
-            if attempt == 0:
-                await asyncio.sleep(1)
+    if conn.is_closed():
+        raise ConnectionError("SSH connection closed after banner handling")
+
+    await _disable_paging(conn, ctx, retries=2)
 
     return conn
 
