@@ -777,6 +777,10 @@ def _get_check_int_override(
         return default
 
 
+def _result_check_key(check_name: str) -> str:
+    return check_name if check_name != "Link Status" else "Interface Status"
+
+
 # ---------------------------------------------------------------------------
 # Per-device execution (mirrors execute_show_commands)
 # ---------------------------------------------------------------------------
@@ -798,8 +802,23 @@ async def _execute_checks(
     brand_category = ctx["brand_category"]
     host_group = ctx.get("host_group")
     network_command_executer = NetworkFactory.get_network_brand_object(brand_category)
+    check_items = list(checks.items())
 
-    for each_check, command in checks.items():
+    def set_failed_check(check_name: str, err: Optional[str]) -> None:
+        result_dict[_result_check_key(check_name)] = {
+            "status": HealthStatus.FAIL.value,
+            "output": None,
+            "err": err,
+        }
+
+    def add_reachable_ping_status() -> None:
+        result_dict["Ping Status"] = {
+            "status": "REACHABLE",
+            "output": None,
+            "err": None,
+        }
+
+    for each_check, command in check_items:
         cmd = command["command"]
         cmd_pattern = command["pattern"]
         check_overrides = None
@@ -895,8 +914,7 @@ async def _execute_checks(
                             raw_output,
                         )
 
-                check_key = each_check if each_check != "Link Status" else "Interface Status"
-                result_dict[check_key] = {
+                result_dict[_result_check_key(each_check)] = {
                     "status": status,
                     "output": str(output) if output is not None else None,
                     "err": None,
@@ -916,17 +934,23 @@ async def _execute_checks(
                     try:
                         await conn.interrupt_current_command()
                     except Exception as recover_ex:
-                        raise ConnectionError(
+                        last_error = (
                             f"Unable to recover shell after timeout on "
                             f"'{each_check}': {recover_ex}"
-                        ) from recover_ex
+                        )
+                        logger.warning(f"[{ctx['device_ip']}] {last_error}")
+                        set_failed_check(each_check, last_error)
+                        add_reachable_ping_status()
+                        return result_dict
             except EOFError:
                 last_error = "EOFError: connection dropped"
                 logger.warning(
                     f"[{ctx['device_ip']}] EOFError on '{each_check}' "
                     f"attempt {attempt + 1}"
                 )
-                break
+                set_failed_check(each_check, last_error)
+                add_reachable_ping_status()
+                return result_dict
             except Exception as ex:
                 last_error = str(ex)
                 logger.warning(
@@ -935,18 +959,9 @@ async def _execute_checks(
                 )
 
         else:
-            check_key = each_check if each_check != "Link Status" else "Interface Status"
-            result_dict[check_key] = {
-                "status": HealthStatus.FAIL.value,
-                "output": None,
-                "err": last_error,
-            }
+            set_failed_check(each_check, last_error)
 
-    result_dict["Ping Status"] = {
-        "status": "REACHABLE",
-        "output": None,
-        "err": None,
-    }
+    add_reachable_ping_status()
     return result_dict
 
 
