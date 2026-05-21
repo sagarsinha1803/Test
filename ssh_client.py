@@ -38,6 +38,49 @@ PRESS_ANY_KEY_PATTERNS = [
     "space for more",
 ]
 
+LEGACY_KEX_ALGS = [
+    "diffie-hellman-group1-sha1",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+]
+
+LEGACY_KEX_ERROR_PATTERNS = [
+    "No matching key exchange algorithm",
+    "diffie-hellman-group1-sha1",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+]
+
+
+def _is_legacy_kex_error(ex: Exception) -> bool:
+    msg = str(ex)
+    if "No matching key exchange algorithm" not in msg:
+        return False
+    return any(pattern in msg for pattern in LEGACY_KEX_ERROR_PATTERNS[1:])
+
+
+async def _connect_device_transport(
+    bastion_conn: asyncssh.SSHClientConnection,
+    ctx: dict[str, Any],
+    connect_timeout: int,
+    *,
+    legacy_kex: bool = False,
+) -> asyncssh.SSHClientConnection:
+    connect_kwargs = {}
+    if legacy_kex:
+        connect_kwargs["kex_algs"] = LEGACY_KEX_ALGS
+
+    return await asyncssh.connect(
+        host=ctx["device_ip"],
+        port=int(ctx["port"]),
+        username=ctx["username"],
+        password=ctx["password"],
+        known_hosts=None,
+        connect_timeout=connect_timeout,
+        tunnel=bastion_conn,
+        **connect_kwargs,
+    )
+
 
 async def ping_via_bastion(
     bastion_conn: asyncssh.SSHClientConnection,
@@ -356,16 +399,26 @@ async def connect_device(
     connect_timeout: int,
 ) -> DeviceShellSession:
     """Open an SSH tunnel to the device through the bastion and start an interactive CLI shell."""
-    conn = await asyncssh.connect(
-        host=ctx["device_ip"],
-        port=int(ctx["port"]),
-        username=ctx["username"],
-        password=ctx["password"],
-        known_hosts=None,
-        connect_timeout=connect_timeout,
-        tunnel=bastion_conn,
-        # preferred_algs={ ... }  # enable only if you must for legacy gear
-    )
+    try:
+        conn = await _connect_device_transport(
+            bastion_conn,
+            ctx,
+            connect_timeout,
+        )
+    except asyncssh.DisconnectError as ex:
+        if not _is_legacy_kex_error(ex):
+            raise
+
+        logger.warning(
+            f"[{ctx['device_ip']}] Legacy SSH KEX detected for "
+            f"{ctx.get('device_name')}, retrying with legacy KEX algorithms"
+        )
+        conn = await _connect_device_transport(
+            bastion_conn,
+            ctx,
+            connect_timeout,
+            legacy_kex=True,
+        )
 
     logger.info(f"[{ctx['device_ip']}] SSH authenticated")
 
