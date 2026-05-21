@@ -16,6 +16,39 @@ from .ssh_client import connect_device, ping_via_bastion
 logger = logging.getLogger(__name__)
 
 
+async def _connect_device_with_retry(
+    ctx: dict[str, Any],
+    bastion_conn: asyncssh.SSHClientConnection,
+    connect_timeout: int,
+    max_attempts: int = 2,
+    retry_delay: float = 1.5,
+) -> Any:
+    device_ip = ctx["device_ip"]
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await connect_device(
+                bastion_conn,
+                ctx,
+                connect_timeout,
+            )
+        except (asyncio.TimeoutError, asyncssh.DisconnectError, ConnectionError) as ex:
+            last_error = ex
+            if attempt >= max_attempts:
+                raise
+
+            logger.warning(
+                f"[{device_ip}] SSH setup failed attempt "
+                f"{attempt}/{max_attempts}: {ex}; retrying"
+            )
+            await asyncio.sleep(retry_delay)
+
+    if last_error is not None:
+        raise last_error
+    raise ConnectionError("SSH setup failed without an exception")
+
+
 async def device_worker(
     ctx: dict[str, Any],
     bastion_conn: asyncssh.SSHClientConnection,
@@ -50,9 +83,9 @@ async def device_worker(
         # 3) SSH connect via bastion tunnel.
         device_conn: Any | None = None
         try:
-            device_conn = await connect_device(
-                bastion_conn,
+            device_conn = await _connect_device_with_retry(
                 ctx,
+                bastion_conn,
                 connect_timeout,
             )
             logger.info(f"[{device_ip}] SSH connected")
