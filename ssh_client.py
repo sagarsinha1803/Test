@@ -38,25 +38,48 @@ PRESS_ANY_KEY_PATTERNS = [
     "space for more",
 ]
 
-LEGACY_KEX_ALGS = [
-    "diffie-hellman-group1-sha1",
-    "diffie-hellman-group14-sha1",
-    "diffie-hellman-group-exchange-sha1",
-]
+DEFAULT_PLUS_LEGACY_KEX_ALGS = (
+    "+diffie-hellman-group1-sha1,"
+    "diffie-hellman-group14-sha1,"
+    "diffie-hellman-group-exchange-sha1"
+)
 
-LEGACY_KEX_ERROR_PATTERNS = [
+DEFAULT_PLUS_LEGACY_ENCRYPTION_ALGS = (
+    "+aes128-cbc,"
+    "aes192-cbc,"
+    "aes256-cbc,"
+    "3des-cbc"
+)
+
+DEFAULT_PLUS_LEGACY_MAC_ALGS = "+hmac-sha1,hmac-sha1-96"
+
+LEGACY_SSH_ERROR_PATTERNS = [
     "No matching key exchange algorithm",
+    "No matching encryption algorithm",
+    "No matching MAC algorithm",
     "diffie-hellman-group1-sha1",
     "diffie-hellman-group14-sha1",
     "diffie-hellman-group-exchange-sha1",
+    "aes128-cbc",
+    "aes192-cbc",
+    "aes256-cbc",
+    "3des-cbc",
+    "hmac-sha1",
 ]
 
 
-def _is_legacy_kex_error(ex: Exception) -> bool:
+def _is_legacy_ssh_algorithm_error(ex: Exception) -> bool:
     msg = str(ex)
-    if "No matching key exchange algorithm" not in msg:
+    if not any(
+        heading in msg
+        for heading in (
+            "No matching key exchange algorithm",
+            "No matching encryption algorithm",
+            "No matching MAC algorithm",
+        )
+    ):
         return False
-    return any(pattern in msg for pattern in LEGACY_KEX_ERROR_PATTERNS[1:])
+    return any(pattern in msg for pattern in LEGACY_SSH_ERROR_PATTERNS[3:])
 
 
 async def _connect_device_transport(
@@ -64,11 +87,13 @@ async def _connect_device_transport(
     ctx: dict[str, Any],
     connect_timeout: int,
     *,
-    legacy_kex: bool = False,
+    legacy_algorithms: bool = False,
 ) -> asyncssh.SSHClientConnection:
     connect_kwargs = {}
-    if legacy_kex:
-        connect_kwargs["kex_algs"] = LEGACY_KEX_ALGS
+    if legacy_algorithms:
+        connect_kwargs["kex_algs"] = DEFAULT_PLUS_LEGACY_KEX_ALGS
+        connect_kwargs["encryption_algs"] = DEFAULT_PLUS_LEGACY_ENCRYPTION_ALGS
+        connect_kwargs["mac_algs"] = DEFAULT_PLUS_LEGACY_MAC_ALGS
 
     return await asyncssh.connect(
         host=ctx["device_ip"],
@@ -406,18 +431,18 @@ async def connect_device(
             connect_timeout,
         )
     except asyncssh.DisconnectError as ex:
-        if not _is_legacy_kex_error(ex):
+        if not _is_legacy_ssh_algorithm_error(ex):
             raise
 
         logger.warning(
-            f"[{ctx['device_ip']}] Legacy SSH KEX detected for "
-            f"{ctx.get('device_name')}, retrying with legacy KEX algorithms"
+            f"[{ctx['device_ip']}] Legacy SSH algorithms detected for "
+            f"{ctx.get('device_name')}, retrying with legacy KEX/cipher/MAC algorithms"
         )
         conn = await _connect_device_transport(
             bastion_conn,
             ctx,
             connect_timeout,
-            legacy_kex=True,
+            legacy_algorithms=True,
         )
 
     logger.info(f"[{ctx['device_ip']}] SSH authenticated")
