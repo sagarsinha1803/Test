@@ -74,3 +74,29 @@ module.exports = { activate, deactivate };
 
 
 curl -X POST http://localhost:11434/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}"
+
+
+
+
+
+{
+  "name": "tstvs",
+  "displayName": "TstVS LM Bridge",
+  "description": "Expose VS Code Copilot LM as local OpenAI-compatible endpoint",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": { "vscode": "^1.95.0" },
+  "main": "./extension.js",
+  "activationEvents": [ "onStartupFinished" ],
+  "contributes": {
+    "commands": [
+      { "command": "tstvs.status", "title": "TstVS: Bridge Status" },
+      { "command": "tstvs.models", "title": "TstVS: List Copilot Models" }
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/vscode": "^1.125.0",
+    "typescript": "^7.0.2"
+  }
+}
