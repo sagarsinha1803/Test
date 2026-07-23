@@ -273,3 +273,121 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Minimal Streamlit chat UI for the MCP-backed LangGraph agent.
+
+Run (avoids Device Guard by not invoking streamlit.exe):
+    python -m pip install --user streamlit
+    python -m streamlit run chat.py
+
+Needs the vscode.lm bridge running (F5 in VS Code) on localhost:11434.
+"""
+import asyncio
+import streamlit as st
+from agent import build_agent
+
+SYSTEM = "Reply in plain text. No LaTeX, no markdown math, no $ symbols."
+
+st.set_page_config(page_title="Copilot Agent", page_icon="🤖")
+st.title("🤖 Copilot Agent (vscode.lm + MCP)")
+
+if "history" not in st.session_state:
+    st.session_state.history = []   # list of (role, text)
+
+
+async def ask(msgs):
+    # build + invoke in one event loop -> MCP stdio sessions stay in-loop
+    app = await build_agent()
+    return await app.ainvoke({"messages": msgs})
+
+
+# replay past turns
+for role, text in st.session_state.history:
+    st.chat_message(role).write(text)
+
+prompt = st.chat_input("Ask something...")
+if prompt:
+    st.session_state.history.append(("user", prompt))
+    st.chat_message("user").write(prompt)
+
+    msgs = [("system", SYSTEM)]
+    for role, text in st.session_state.history:
+        msgs.append(("assistant" if role == "assistant" else "user", text))
+
+    with st.chat_message("assistant"):
+        with st.spinner("thinking..."):
+            try:
+                out = asyncio.run(ask(msgs))
+                answer = out["messages"][-1].content or "(no text)"
+            except Exception as e:
+                answer = f"error: {e}"
+        st.write(answer)
+
+    st.session_state.history.append(("assistant", answer))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Demo MCP server (standalone fastmcp package) -- calculator + word_length.
+
+Run standalone (stdio transport):
+    python -m pip install --user fastmcp
+    python tools_mcp.py
+
+The agent connects via MultiServerMCPClient:
+    "tools": {"command": "python", "args": ["tools_mcp.py"], "transport": "stdio"}
+"""
+from fastmcp import FastMCP
+
+mcp = FastMCP("tools")
+
+
+@mcp.tool()
+def calculator(expr: str) -> str:
+    """Evaluate a math expression, e.g. '23*7+1'."""
+    try:
+        return str(eval(expr, {"__builtins__": {}}, {}))
+    except Exception as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def word_length(word: str) -> str:
+    """Count the characters in a word."""
+    return str(len(word.strip().strip("'\"")))
+
+
+if __name__ == "__main__":
+    mcp.run()   # stdio
+
