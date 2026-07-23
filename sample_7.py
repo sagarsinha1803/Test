@@ -69,3 +69,8 @@ function deactivate() {
 }
 
 module.exports = { activate, deactivate };
+
+
+
+
+curl -X POST http://localhost:11434/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}"
