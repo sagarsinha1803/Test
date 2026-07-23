@@ -40,8 +40,8 @@ def _stdio(script):
 
 
 MCP_SERVERS = {
-    "unicorn": _stdio("unicorn_server.py"),
-    "ssh":     _stdio("troubleshoot_agent_mcp.py"),
+    "unicorn": _stdio("unicorn_mcp.py"),
+    # "ssh":   _stdio("troubleshoot_agent_mcp.py"),   # commented: isolate unicorn first
 }
 
 UNICORN_TOOL = "get_device_details"        # {"device_name", "region"}
@@ -52,6 +52,8 @@ llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="dummy",
                  model=MODEL, temperature=0)
 
 REQUIRE_APPROVAL = True   # human-in-the-loop gate before every SSH tool call
+MAX_HOPS = 3              # cap traceroute hops so it can't run long
+PING_COUNT = 3            # number of ping probes (Cisco default is 5)
 
 
 # ---- helpers to normalize MCP results (may arrive as JSON strings) ----------
@@ -145,12 +147,13 @@ async def build(checkpointer=None):
 
     async def ping(state: State):
         out = await ssh_run(state["source"], state.get("src_region"),
-                            f"ping {state['dest']}")
+                            f"ping {state['dest']} repeat {PING_COUNT}")
         return {"ping_raw": out, "ping_ok": _ping_ok(out)}
 
     async def traceroute(state: State):
-        out = await ssh_run(state["source"], state.get("src_region"),
-                            f"traceroute {state['dest']}")
+        # Cisco: 'ttl 1 <max>' bounds hops; short timeout/probe so it returns fast
+        cmd = f"traceroute {state['dest']} ttl 1 {MAX_HOPS} timeout 1 probe 1"
+        out = await ssh_run(state["source"], state.get("src_region"), cmd)
         prompt = ('From this traceroute, return ONLY JSON: '
                   '{"hops":[...ordered names/ips...], "failed_after":"<last responding '
                   'hop before timeouts, or null>"}.\n\n' + out)
