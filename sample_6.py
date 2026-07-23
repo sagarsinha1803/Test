@@ -1,1220 +1,754 @@
+"""Basic source->dest reachability agent (LangGraph, deterministic) with a
+human-in-the-loop gate before EVERY SSH tool call.
+
+Wired to the user's real MCPs:
+  - unicorn : get_device_details(device_name, region)  -> {"region","data"} | str
+  - ssh     : execute_query_on_server(device_ip, commands[list], region, port)
+
+Flow:
+  1. cmdb       Unicorn -> device details (source + dest); grab SOURCE region
+  2. ping       SSH     -> ping <dest> ON source   (paused for approval)
+  3. traceroute SSH     -> traceroute <dest>, only if ping failed (paused)
+  4. report     LLM     -> plain-text summary + likely cause
+
+The SSH gate uses LangGraph interrupt(): the graph pauses, the caller (CLI or
+Streamlit UI) approves/rejects, then resumes with Command(resume=bool).
+
+    uv run python agent/path_agent.py --source 10.10.1.20 --dest 172.20.5.10
+"""
+import argparse
 import asyncio
-import logging
+import json
+import os
 import re
-from typing import Any, Optional, Iterable
-from traceback import format_exc
-from types import SimpleNamespace
+import sys
+from typing import Optional, TypedDict
 
-import asyncssh
+from langchain_openai import ChatOpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
 
-from app.config import BaseConfig as Settings
-from app.dal.nornir_dal import NornirDal
-from app.utils.constants import HealthStatus, NETMIKO_TIMED_BRAND
-from app.utils.common import (
-    get_device_dashboard_config,
-    get_brand_model_pattern_config,
-    get_brand_models_commands,
-    get_all_check_for_device,
-    get_device_override_config,
-    remove_pinged_check_brand_model,
-    get_region_override_commands,
-    get_region_override_data,
-)
-from app.utils.network_commands_factory.network_factory import NetworkFactory
-from app.utils.hostgroups_override import get_hostgroup
-
-logger = logging.getLogger(__name__)
+# ---- CONFIG: point at YOUR unicorn + ssh MCP files --------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-# ---------------------------------------------------------------------------
-# Helpers: device filtering
-# ---------------------------------------------------------------------------
-
-def _filter_devices(
-    devices: list[Any],
-    device_names: Optional[Iterable[str]] = None,
-    device_ips: Optional[Iterable[str]] = None,
-    device_name_regex: Optional[str] = None,
-    exclude_names: Optional[Iterable[str]] = None,
-    exclude_ips: Optional[Iterable[str]] = None,
-) -> list[Any]:
-    """
-    Filter device objects from DB (must have device_name and device_ip attributes).
-
-    Include logic:
-      - If any include filter is provided (names/ips/regex): device must match ANY of them.
-      - If no include filters are provided: include all.
-
-    Exclude logic:
-      - Excludes are applied last (always).
-    """
-    name_set = {str(x).strip() for x in (device_names or []) if x and str(x).strip()}
-    ip_set = {str(x).strip() for x in (device_ips or []) if x and str(x).strip()}
-    ex_name_set = {str(x).strip() for x in (exclude_names or []) if x and str(x).strip()}
-    ex_ip_set = {str(x).strip() for x in (exclude_ips or []) if x and str(x).strip()}
-
-    name_re = re.compile(device_name_regex) if device_name_regex else None
-
-    def matches_include(d) -> bool:
-        if not name_set and not ip_set and not name_re:
-            return True
-        dn = getattr(d, "device_name", "") or ""
-        dip = getattr(d, "device_ip", "") or ""
-        if name_set and dn in name_set:
-            return True
-        if ip_set and dip in ip_set:
-            return True
-        if name_re and name_re.search(dn):
-            return True
-        return False
-
-    def matches_exclude(d) -> bool:
-        dn = getattr(d, "device_name", "") or ""
-        dip = getattr(d, "device_ip", "") or ""
-        return (dn in ex_name_set) or (dip in ex_ip_set)
-
-    out: list[Any] = []
-    for d in devices:
-        if matches_include(d) and not matches_exclude(d):
-            out.append(d)
-    return out
+def _stdio(script):
+    return {"command": sys.executable, "args": [os.path.join(_HERE, script)],
+            "transport": "stdio"}
 
 
-# ---------------------------------------------------------------------------
-# Helpers: device context + platform
-# ---------------------------------------------------------------------------
+MCP_SERVERS = {
+    "unicorn": _stdio("unicorn_server.py"),
+    "ssh":     _stdio("troubleshoot_agent_mcp.py"),
+}
 
-def _build_device_context(
-    device,
-    commands_dict: dict,
-    device_brand_checks_list,
-    device_dashboard_override: dict,
-    device_brand_region: str,
-) -> dict[str, Any]:
-    """
-    Mirror the logic of get_device_host_object() from nornir_inventory_manager.
-    Returns a plain dict instead of a Nornir Host object.
-    """
-    brand_model = device.brand_model
-    device_type = device.device_type
-    name = device.device_name
-    dashboard = device.dashboard
+UNICORN_TOOL = "get_device_details"        # {"device_name", "region"}
+SSH_TOOL     = "execute_query_on_server"    # {"device_ip", "commands":[..], "region", "port"}
 
-    only_ping_check = True
-    brand_category = None
-    commands = None
-    username = None
-    password = None
+MODEL = "gpt-4o"
+llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="dummy",
+                 model=MODEL, temperature=0)
 
-    if brand_model in commands_dict:
-        brand_model_category = commands_dict[brand_model]["brand_category"]
-
-        if device_brand_region != "PARIS":
-            username = Settings.DEVICE_CREDENTIALS.get(device_brand_region, {}).get("DEVICE_USERNAME")
-            password = Settings.DEVICE_CREDENTIALS.get(device_brand_region, {}).get("DEVICE_PASSWORD")
-        else:
-            if brand_model_category in Settings.DEVICE_CREDENTIALS_BRAND_BASE:
-                username = Settings.DEVICE_CREDENTIALS_BRAND_BASE[brand_model_category].get("DEVICE_USERNAME")
-                password = Settings.DEVICE_CREDENTIALS_BRAND_BASE[brand_model_category].get("DEVICE_PASSWORD")
-            else:
-                username = Settings.DEVICE_CREDENTIALS.get(device_brand_region, {}).get("DEVICE_USERNAME")
-                password = Settings.DEVICE_CREDENTIALS.get(device_brand_region, {}).get("DEVICE_PASSWORD")
-
-        override_brand = device_dashboard_override.get(device_type)
-        if override_brand:
-            commands = override_brand
-            brand_category = "override_" + brand_model
-        else:
-            commands = get_all_check_for_device(
-                commands_dict[brand_model]["checks"],
-                device_brand_checks_list,
-            )
-            brand_category = commands_dict[brand_model]["brand_category"]
-
-        override_region = get_region_override_data().get(dashboard)
-        if override_region:
-            commands, brand_category = get_region_override_commands(
-                commands,
-                dashboard,
-                name,
-                brand_model,
-                brand_category,
-            )
-
-        # Keep original behavior: only ping if commands is None.
-        # If you want empty dict to behave as only-ping, change to:
-        # only_ping_check = not commands
-        only_ping_check = commands is None
-
-        host_group = get_hostgroup(name, dashboard, brand_category)
-        if host_group is not None and commands is not None:
-            for chk in host_group.checks_to_exclude:
-                try:
-                    commands.pop(chk)
-                except KeyError:
-                    pass
-        else:
-            host_group = None
-
-    return {
-        "device_name": name,
-        "device_ip": device.device_ip,
-        "port": device.port,
-        "dashboard": dashboard,
-        "assert_id": device.assert_id,
-        "infra_type": device.infra_type,
-        "infra_name": device.infra_name,
-        "brand_model": brand_model,
-        "device_id": device.id,
-        "device_type": device_type,
-        "os_type": device.os_type,
-        "brand_category": brand_category,
-        "only_ping_check": only_ping_check,
-        "region": device_brand_region,
-        "username": username,
-        "password": password,
-        "host_group": host_group,
-        "checks": {"commands": commands},
-    }
+REQUIRE_APPROVAL = True   # human-in-the-loop gate before every SSH tool call
 
 
-def _detect_platform(ctx: dict[str, Any]) -> str:
-    """Mirror fetch_host_platform() logic from device_helper."""
-    from app.utils.constants import (
-        ARISTA_SERIES,
-        CHECK_POINT_SERIES,
-        CITRIX_SERIES,
-        F5_NETWORK_SERIES,
-        SKYHIGH_SERIES,
-        FORTINET_SERIES,
-    )
-
-    brand_category = ctx.get("brand_category", "")
-    os_type = ctx.get("os_type", "")
-
-    if brand_category in FORTINET_SERIES:
-        return "fortinet"
-    elif brand_category in ARISTA_SERIES:
-        return "cisco_ios" if os_type == "mos" else "arista_eos"
-    elif brand_category in CITRIX_SERIES:
-        return "netscaler"
-    elif brand_category in CHECK_POINT_SERIES:
-        return "cisco_ios"
-    elif brand_category in F5_NETWORK_SERIES:
-        return "f5_tmsh"
-    elif brand_category in SKYHIGH_SERIES:
-        return "linux"
-    else:
-        if os_type == "nx-os":
-            return "cisco_nxos"
-        elif os_type == "ios-xe":
-            return "cisco_xe"
-        elif os_type in ("ios-xrv", "ios-xr"):
-            return "cisco_xr"
-        return "cisco_ios"
-
-
-# ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-
-async def _ping_via_bastion(
-    bastion_conn: asyncssh.SSHClientConnection,
-    ip: str,
-    timeout: int = 5,
-) -> bool:
-    try:
-        r = await asyncio.wait_for(
-            bastion_conn.run(f"ping -c 1 -W 1 {ip}", check=False),
-            timeout=timeout,
-        )
-        return r.exit_status == 0
-    except Exception:
-        return False
-
-
-_PROMPT_RE = re.compile(
-    r"(?m)(?:^|\n).{0,120}(\s+\(.*\))?\s*[#>$]\s*$"
-)
-
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
-)
-
-_CONTROL_CHARS_RE = re.compile(
-    r"[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]"
-)
-
-_ACCEPT_A_PATTERNS = [
-    "press 'a' to accept",
-    "press a to accept",
-    "(press 'a' to accept)",
-    "(press a to accept)",
-]
-
-_PRESS_ANY_KEY_PATTERNS = [
-    "press any key",
-    "press enter",
-    "hit any key",
-    "continue",
-    "press return",
-    "--more--",
-    "-- more --",
-    "space for more",
-]
-
-
-async def _handle_interactive_login_banner(
-    conn: asyncssh.SSHClientConnection,
-    ctx: dict[str, Any],
-    timeout: int = 12,
-) -> None:
-    """
-    Handle interactive banners which block login, e.g. (Press 'a' to accept).
-
-    This opens a temporary interactive shell, reads initial output,
-    auto-sends responses, and waits until a stable prompt appears (best-effort).
-    """
-    device_ip = ctx.get("device_ip", "unknown")
-
-    proc = None
-    buf = ""
-    start = asyncio.get_event_loop().time()
-
-    try:
-        proc = await conn.create_process(term_type="vt100")
-
-        # Give the device a moment to send the initial banner.
-        await asyncio.sleep(0.5)
-
-        consecutive_prompt_hits = 0
-
-        while True:
-            elapsed = asyncio.get_event_loop().time() - start
-            if elapsed > timeout:
-                logger.warning(
-                    f"[{device_ip}] Banner handling timeout after {timeout}s"
-                )
-                break
-
-            try:
-                chunk = await asyncio.wait_for(
-                    proc.stdout.read(1024),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                chunk = ""
-
-            if chunk:
-                buf += chunk
-
-                if len(buf) > 20000:
-                    buf = buf[-20000:]
-
-                buf_lower = buf.lower()
-
-                if any(p in buf_lower for p in _ACCEPT_A_PATTERNS):
-                    logger.info(
-                        f"[{device_ip}] Detected accept banner, sending 'a'"
-                    )
-                    proc.stdin.write("a\n")
-                    await proc.stdin.drain()
-                    await asyncio.sleep(0.5)
-                    buf = ""
-                    consecutive_prompt_hits = 0
-                    continue
-
-                if any(p in buf_lower for p in _PRESS_ANY_KEY_PATTERNS):
-                    logger.info(
-                        f"[{device_ip}] Detected press-any-key banner, sending ENTER"
-                    )
-                    proc.stdin.write("\n")
-                    await proc.stdin.drain()
-                    await asyncio.sleep(0.5)
-                    buf = ""
-                    consecutive_prompt_hits = 0
-                    continue
-
-                if _PROMPT_RE.search(buf):
-                    consecutive_prompt_hits += 1
-                    if consecutive_prompt_hits >= 2:
-                        logger.info(
-                            f"[{device_ip}] Stable prompt detected, banner handling complete"
-                        )
-                        break
-                    await asyncio.sleep(0.3)
-                    continue
-
-                consecutive_prompt_hits = 0
-            else:
-                await asyncio.sleep(0.1)
-
-    except Exception as ex:
-        logger.warning(f"[{device_ip}] Banner handling failed: {ex}")
-    finally:
+# ---- helpers to normalize MCP results (may arrive as JSON strings) ----------
+def _as_obj(res):
+    if isinstance(res, (dict, list)):
+        return res
+    if isinstance(res, str):
         try:
-            if proc:
-                proc.close()
+            return json.loads(res)
         except Exception:
-            pass
-
-    await asyncio.sleep(0.3)
-
-
-class _DeviceShellSession:
-    """
-    Keep one interactive CLI shell open for the whole device session.
-
-    Many network devices do not behave like Linux SSH servers. They may reject
-    SSH exec requests, or close the SSH transport after an exec-style command.
-    This wrapper runs terminal setup and show commands through one persistent
-    shell channel instead.
-    """
-
-    def __init__(
-        self,
-        conn: asyncssh.SSHClientConnection,
-        ctx: dict[str, Any],
-    ) -> None:
-        self.conn = conn
-        self.ctx = ctx
-        self.proc = None
-
-    def is_closed(self) -> bool:
-        return self.conn.is_closed()
-
-    async def open(self, timeout: int = 12) -> None:
-        device_ip = self.ctx.get("device_ip", "unknown")
-        try:
-            self.proc = await self.conn.create_process(
-                term_type="vt100",
-                term_size=(511, 1000),
-            )
-        except TypeError:
-            self.proc = await self.conn.create_process(term_type="vt100")
-        await asyncio.sleep(0.5)
-        await self._read_until_prompt(
-            timeout=timeout,
-            allow_banner_responses=True,
-            send_initial_newline=True,
-        )
-        logger.info(f"[{device_ip}] Interactive shell ready")
-
-    async def run(self, cmd: str, check: bool = False):
-        del check
-        stdout = await self.run_command(cmd)
-        return SimpleNamespace(stdout=stdout, stderr="", exit_status=0)
-
-    async def run_command(self, cmd: str, timeout: int = 60) -> str:
-        if self.proc is None:
-            raise ConnectionError("Interactive shell is not open")
-        if self.conn.is_closed():
-            raise ConnectionError("SSH connection is closed")
-
-        cmd = cmd.strip()
-        if not cmd:
-            return ""
-
-        await self._drain_available()
-
-        self.proc.stdin.write(cmd + "\n")
-        await self.proc.stdin.drain()
-
-        output = await self._read_until_prompt(
-            timeout=timeout,
-            allow_banner_responses=False,
-            send_initial_newline=False,
-        )
-        return self._clean_command_output(cmd, output)
-
-    async def _read_until_prompt(
-        self,
-        timeout: int,
-        allow_banner_responses: bool,
-        send_initial_newline: bool,
-    ) -> str:
-        if self.proc is None:
-            raise ConnectionError("Interactive shell is not open")
-
-        device_ip = self.ctx.get("device_ip", "unknown")
-        buf = ""
-        empty_reads = 0
-        start = asyncio.get_event_loop().time()
-
-        while True:
-            elapsed = asyncio.get_event_loop().time() - start
-            if elapsed > timeout:
-                raise asyncio.TimeoutError(
-                    f"Timed out waiting for prompt after {timeout}s"
-                )
-
-            if self.conn.is_closed():
-                raise ConnectionError("SSH connection closed while waiting for prompt")
-
-            try:
-                chunk = await asyncio.wait_for(
-                    self.proc.stdout.read(1024),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                chunk = ""
-
-            if not chunk:
-                empty_reads += 1
-                if send_initial_newline and empty_reads == 2:
-                    self.proc.stdin.write("\n")
-                    await self.proc.stdin.drain()
-                await asyncio.sleep(0.1)
-                continue
-
-            empty_reads = 0
-            buf += chunk
-            if len(buf) > 20000:
-                buf = buf[-20000:]
-
-            buf_lower = buf.lower()
-
-            if allow_banner_responses and any(p in buf_lower for p in _ACCEPT_A_PATTERNS):
-                logger.info(f"[{device_ip}] Detected accept banner, sending 'a'")
-                self.proc.stdin.write("a\n")
-                await self.proc.stdin.drain()
-                await asyncio.sleep(0.5)
-                buf = ""
-                continue
-
-            if allow_banner_responses and any(p in buf_lower for p in _PRESS_ANY_KEY_PATTERNS):
-                logger.info(f"[{device_ip}] Detected press-any-key banner, sending ENTER")
-                self.proc.stdin.write("\n")
-                await self.proc.stdin.drain()
-                await asyncio.sleep(0.5)
-                buf = ""
-                continue
-
-            if self._buffer_has_prompt(buf):
-                buf = await self._settle_after_prompt(buf)
-                return buf
-
-    async def _drain_available(self) -> None:
-        if self.proc is None:
-            return
-
-        for _ in range(5):
-            try:
-                await asyncio.wait_for(self.proc.stdout.read(4096), timeout=0.05)
-            except asyncio.TimeoutError:
-                break
-
-    async def _settle_after_prompt(self, buf: str) -> str:
-        if self.proc is None:
-            return buf
-
-        await asyncio.sleep(0.2)
-        for _ in range(5):
-            try:
-                chunk = await asyncio.wait_for(
-                    self.proc.stdout.read(4096),
-                    timeout=0.05,
-                )
-            except asyncio.TimeoutError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-        return buf
-
-    @staticmethod
-    def _buffer_has_prompt(buf: str) -> bool:
-        clean = _DeviceShellSession._strip_terminal_control(buf)
-        lines = clean.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-        for line in reversed(lines):
-            if not line.strip():
-                continue
-            return bool(_PROMPT_RE.search("\n" + line))
-        return False
-
-    @staticmethod
-    def _clean_command_output(cmd: str, output: str) -> str:
-        output = _DeviceShellSession._strip_terminal_control(output)
-        lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-
-        while lines and not lines[0].strip():
-            lines.pop(0)
-
-        while lines and _DeviceShellSession._is_echo_line(lines[0], cmd):
-            lines = lines[1:]
-
-        while lines and not lines[-1].strip():
-            lines.pop()
-
-        if lines and _PROMPT_RE.search("\n" + lines[-1]):
-            lines = lines[:-1]
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _strip_terminal_control(output: str) -> str:
-        output = _ANSI_ESCAPE_RE.sub("", output)
-
-        chars: list[str] = []
-        for ch in output:
-            if ch == "\b":
-                if chars and chars[-1] not in "\r\n":
-                    chars.pop()
-                continue
-            chars.append(ch)
-
-        output = "".join(chars)
-        return _CONTROL_CHARS_RE.sub("", output)
-
-    @staticmethod
-    def _is_echo_line(line: str, cmd: str) -> bool:
-        line_norm = re.sub(r"\s+", " ", line.strip())
-        cmd_norm = re.sub(r"\s+", " ", cmd.strip())
-
-        if not line_norm:
-            return True
-        if line_norm == cmd_norm:
-            return True
-        if line_norm.startswith(cmd_norm[: min(len(cmd_norm), 30)]):
-            return True
-        if cmd_norm.startswith(line_norm) and len(line_norm) >= 8:
-            return True
-        return False
-
-    def close(self) -> None:
-        try:
-            if self.proc is not None:
-                self.proc.close()
-        except Exception:
-            pass
-        self.conn.close()
-
-    async def wait_closed(self) -> None:
-        await self.conn.wait_closed()
+            return res
+    return res
 
 
-async def _disable_paging(
-    conn: Any,
-    ctx: dict[str, Any],
-    retries: int = 2,
-) -> bool:
-    """
-    Disable paging if the device accepts Cisco-style terminal setup.
+def _region_of(unicorn_res):
+    o = _as_obj(unicorn_res)
+    if isinstance(o, dict) and o.get("region"):
+        return str(o["region"]).upper()
+    if isinstance(unicorn_res, str):
+        m = re.search(r'"region"\s*:\s*"([^"]+)"', unicorn_res)
+        if m:
+            return m.group(1).upper()
+    return None
 
-    Returns True when the command completed. Returns False when it timed out or
-    failed while the SSH connection stayed open. Raises if the SSH connection
-    itself closes, because the caller must reconnect in that case.
-    """
-    device_ip = ctx["device_ip"]
 
-    try:
-        await asyncio.wait_for(
-            conn.run("terminal width 511", check=False),
-            timeout=5,
-        )
-    except Exception as ex:
-        logger.debug(f"[{device_ip}] terminal width 511 skipped/failed: {ex}")
-        if conn.is_closed():
-            raise ConnectionError(
-                f"SSH connection closed during terminal width setup: {ex}"
-            )
+def _ssh_stdout(ssh_res):
+    o = _as_obj(ssh_res)
+    if isinstance(o, list):
+        return "\n".join(str(r.get("stdout", "")) for r in o if isinstance(r, dict))
+    if isinstance(o, dict):
+        return str(o.get("stdout") or o.get("error") or o)
+    return str(ssh_res)
 
-    for attempt in range(retries):
-        try:
-            await asyncio.wait_for(
-                conn.run("terminal length 0", check=False),
-                timeout=5,
-            )
-            return True
-        except Exception as ex:
-            logger.warning(
-                f"[{device_ip}] terminal length 0 failed "
-                f"attempt {attempt + 1}: {ex}"
-            )
-            if conn.is_closed():
-                raise ConnectionError(
-                    f"SSH connection closed during terminal setup: {ex}"
-                )
-            if attempt + 1 < retries:
-                await asyncio.sleep(1)
 
+def _ping_ok(out: str) -> bool:
+    o = out.lower()
+    if "success rate is 100" in o or "0% packet loss" in o:  return True
+    if re.search(r"success rate is [1-9]\d? percent", o):    return True
     return False
 
 
-async def _connect_device(
-    bastion_conn: asyncssh.SSHClientConnection,
-    ctx: dict[str, Any],
-    connect_timeout: int,
-) -> _DeviceShellSession:
-    """Open an SSH tunnel to the device through the bastion and start an interactive CLI shell."""
-    conn = await asyncssh.connect(
-        host=ctx["device_ip"],
-        port=int(ctx["port"]),
-        username=ctx["username"],
-        password=ctx["password"],
-        known_hosts=None,
-        connect_timeout=connect_timeout,
-        tunnel=bastion_conn,
-        # preferred_algs={ ... }  # enable only if you must for legacy gear
-    )
-
-    logger.info(f"[{ctx['device_ip']}] SSH authenticated")
-
-    session = _DeviceShellSession(conn, ctx)
-    await session.open(
-        timeout=min(12, max(6, connect_timeout)),
-    )
-
-    await _disable_paging(session, ctx, retries=2)
-
-    return session
+class State(TypedDict, total=False):
+    source: str
+    dest: str
+    src_region: Optional[str]
+    cmdb: dict
+    ping_ok: bool
+    ping_raw: str
+    hops: list
+    failed_hop: Optional[str]
+    traceroute_raw: str
+    report: str
 
 
-async def _run_command(
-    conn: Any,
-    cmd: str,
-    timeout: int = 60,
-) -> str:
-    """Run a single command and return stdout."""
-    cmd = cmd.strip()
-    if not cmd:
-        return ""
+async def build(checkpointer=None):
+    client = MultiServerMCPClient(MCP_SERVERS)
+    tools = await client.get_tools()
+    by_name = {t.name: t for t in tools}
 
-    if hasattr(conn, "run_command"):
-        return await conn.run_command(cmd, timeout=timeout)
+    async def call(name, args):
+        tool = by_name.get(name)
+        if not tool:
+            return f"[tool '{name}' not found; have: {list(by_name)}]"
+        try:
+            return await tool.ainvoke(args)
+        except Exception as e:
+            return f"[error calling {name}: {e}]"
 
-    r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=timeout)
-    output = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
+    async def ssh_run(device_ip, region, command):
+        if not region:
+            return "[error: no region for source device - unicorn did not return one]"
+        if REQUIRE_APPROVAL:
+            # pause the graph; caller resumes with Command(resume=True/False)
+            approved = interrupt({
+                "action": "ssh_command",
+                "device_ip": device_ip,
+                "region": region,
+                "command": command,
+            })
+            if not approved:
+                return "[aborted by reviewer]"
+        res = await call(SSH_TOOL, {"device_ip": device_ip, "commands": [command],
+                                    "region": region, "port": 22})
+        return _ssh_stdout(res)
 
-    lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-    if lines and lines[0].strip() == cmd.strip():
-        lines = lines[1:]
+    async def cmdb(state: State):
+        src = await call(UNICORN_TOOL, {"device_name": state["source"], "region": "AUTO"})
+        dst = await call(UNICORN_TOOL, {"device_name": state["dest"], "region": "AUTO"})
+        return {"cmdb": {"source": str(src), "dest": str(dst)},
+                "src_region": _region_of(src)}
 
-    return "\n".join(lines)
+    async def ping(state: State):
+        out = await ssh_run(state["source"], state.get("src_region"),
+                            f"ping {state['dest']}")
+        return {"ping_raw": out, "ping_ok": _ping_ok(out)}
+
+    async def traceroute(state: State):
+        out = await ssh_run(state["source"], state.get("src_region"),
+                            f"traceroute {state['dest']}")
+        prompt = ('From this traceroute, return ONLY JSON: '
+                  '{"hops":[...ordered names/ips...], "failed_after":"<last responding '
+                  'hop before timeouts, or null>"}.\n\n' + out)
+        raw = llm.invoke(prompt).content
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {"hops": [], "failed_after": None}
+        return {"traceroute_raw": out, "hops": data.get("hops", []),
+                "failed_hop": data.get("failed_after")}
+
+    async def report(state: State):
+        evidence = {
+            "source": state["source"], "dest": state["dest"],
+            "source_region": state.get("src_region"),
+            "cmdb": state.get("cmdb"),
+            "ping_ok": state.get("ping_ok"),
+            "path_hops": state.get("hops"),
+            "failed_after_hop": state.get("failed_hop"),
+        }
+        prompt = (
+            "You are a network engineer. Given this evidence (JSON), write a short "
+            "plain-text report: is the destination reachable from the source, the path "
+            "and where it stops (if any), and the most likely cause. No LaTeX, no $.\n\n"
+            + json.dumps(evidence, indent=2, default=str))
+        return {"report": llm.invoke(prompt).content}
+
+    def after_ping(state: State):
+        return "report" if state.get("ping_ok") else "traceroute"
+
+    g = StateGraph(State)
+    for name, fn in [("cmdb", cmdb), ("ping", ping),
+                     ("traceroute", traceroute), ("report", report)]:
+        g.add_node(name, fn)
+    g.add_edge(START, "cmdb")
+    g.add_edge("cmdb", "ping")
+    g.add_conditional_edges("ping", after_ping,
+                            {"report": "report", "traceroute": "traceroute"})
+    g.add_edge("traceroute", "report")
+    g.add_edge("report", END)
+    return g.compile(checkpointer=checkpointer or MemorySaver())
 
 
-async def _run_multiline_commands(
-    conn: Any,
-    commands: list[str],
-    timeout: int = 60,
-) -> str:
-    """Run commands sequentially and concatenate output (non-interactive)."""
-    outputs = []
-    for cmd in commands:
-        out = await _run_command(conn, cmd.strip(), timeout=timeout)
-        outputs.append(out)
-    return "\n".join(outputs)
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", required=True)
+    ap.add_argument("--dest", required=True)
+    args = ap.parse_args()
+
+    app = await build()
+    config = {"configurable": {"thread_id": "cli-1"}}
+    state = await app.ainvoke({"source": args.source, "dest": args.dest}, config)
+
+    # resume loop: keep approving each paused SSH action until the graph finishes
+    while "__interrupt__" in state:
+        payload = state["__interrupt__"][0].value
+        print("\n" + "!" * 60)
+        print("SSH ACTION NEEDS HUMAN APPROVAL")
+        print(f"  device_ip : {payload['device_ip']}")
+        print(f"  region    : {payload['region']}")
+        print(f"  command   : {payload['command']}")
+        print("!" * 60)
+        ans = await asyncio.to_thread(input, "Run this on the device? [y/N]: ")
+        approved = ans.strip().lower() in ("y", "yes")
+        state = await app.ainvoke(Command(resume=approved), config)
+
+    print("\n" + "=" * 60)
+    print(state.get("report", "(no report)"))
 
 
-def _unpack_parser_result(
-    parser_result,
-    ctx: dict[str, Any],
-    check_name: str,
-    raw_output: str,
-) -> tuple[Any, Any]:
-    if parser_result is None:
-        preview = raw_output.replace("\n", "\\n")[:500]
-        raise ValueError(
-            f"Parser returned None for '{check_name}' on "
-            f"{ctx['device_ip']} (raw_len={len(raw_output)}, "
-            f"raw_preview={preview!r})"
-        )
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Streamlit UI for path_agent with human-in-the-loop SSH approval.
+
+    python -m pip install --user streamlit        (or: uv pip install streamlit)
+    python -m streamlit run path_ui.py            (or: uv run streamlit run path_ui.py)
+
+Needs the vscode.lm bridge on :11434 and the unicorn/ssh MCP files alongside.
+
+The graph pauses (interrupt) before every SSH command. The UI shows the pending
+action with Approve / Reject buttons, then resumes the graph.
+"""
+import asyncio
+import uuid
+
+import streamlit as st
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from path_agent import build
+
+st.set_page_config(page_title="Network Troubleshooter", page_icon="🛠️")
+st.title("🛠️ Source → Dest Troubleshooter")
+
+ss = st.session_state
+ss.setdefault("checkpointer", MemorySaver())   # persists across reruns in this session
+ss.setdefault("thread_id", None)
+ss.setdefault("phase", "idle")                 # idle | await_approval | done
+ss.setdefault("pending", None)                 # the interrupt payload
+ss.setdefault("report", None)
+
+
+async def _run(resume=None):
+    """Build the agent (fresh MCP connections) against the persisted checkpointer,
+    then start or resume the graph. Returns the resulting state."""
+    app = await build(checkpointer=ss.checkpointer)
+    config = {"configurable": {"thread_id": ss.thread_id}}
+    if resume is None:
+        return await app.ainvoke({"source": ss.src, "dest": ss.dst}, config)
+    return await app.ainvoke(Command(resume=resume), config)
+
+
+def _apply(state):
+    if "__interrupt__" in state:
+        ss.pending = state["__interrupt__"][0].value
+        ss.phase = "await_approval"
+    else:
+        ss.report = state.get("report", "(no report)")
+        ss.pending = None
+        ss.phase = "done"
+
+
+# ---- input form -------------------------------------------------------------
+with st.form("inputs"):
+    c1, c2 = st.columns(2)
+    src = c1.text_input("Source IP / device", "10.10.1.20")
+    dst = c2.text_input("Destination IP / device", "172.20.5.10")
+    run = st.form_submit_button("Run troubleshooting")
+
+if run:
+    ss.src, ss.dst = src, dst
+    ss.thread_id = str(uuid.uuid4())     # fresh run
+    ss.checkpointer = MemorySaver()
+    ss.report = None
+    _apply(asyncio.run(_run()))
+
+# ---- approval gate ----------------------------------------------------------
+if ss.phase == "await_approval" and ss.pending:
+    p = ss.pending
+    st.warning("SSH action needs approval before it runs on the device.")
+    st.code(f"device_ip : {p['device_ip']}\n"
+            f"region    : {p['region']}\n"
+            f"command   : {p['command']}", language="text")
+    a, r = st.columns(2)
+    if a.button("✅ Approve", use_container_width=True):
+        _apply(asyncio.run(_run(resume=True)))
+        st.rerun()
+    if r.button("❌ Reject", use_container_width=True):
+        _apply(asyncio.run(_run(resume=False)))
+        st.rerun()
+
+# ---- final report -----------------------------------------------------------
+if ss.phase == "done" and ss.report:
+    st.subheader("Troubleshooting Report")
+    st.text(ss.report)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# cat troubleshoot_agent_mcp.py
+# Reconstructed from your screenshots -- verify against your original.
+"""
+Don't run this MCP server directly from the base machine.
+Escalation will arise.
+"""
+
+from environs import Env
+from fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated, Literal
+from sqlalchemy import text
+import paramiko
+import yaml
+
+
+class Settings:
+    # _basedir = os.path.abspath(os.path.dirname(__file__))
+
+    TRAP_HTTP_EXCEPTIONS = True
+    ERROR_404_HELP = True
+    BUNDLE_ERRORS = True
 
     try:
-        status, output = parser_result
-    except TypeError as ex:
-        preview = raw_output.replace("\n", "\\n")[:500]
-        raise ValueError(
-            f"Parser returned invalid result for '{check_name}' on "
-            f"{ctx['device_ip']}: {parser_result!r} "
-            f"(raw_len={len(raw_output)}, raw_preview={preview!r})"
-        ) from ex
+        with open("credentials.yml", "r") as f:
+            credentials = yaml.safe_load(f)
+    except FileNotFoundError:
+        credentials = {}
 
-    return status, output
+    SSH_JUMPHOST_DETAILS = credentials.get("SSH_JUMPHOST_DETAILS", {})
+    DEVICE_DETAILS_SSH = credentials.get("DEVICE_DETAILS_SSH", {})
 
 
-# ---------------------------------------------------------------------------
-# Per-device execution (mirrors execute_show_commands)
-# ---------------------------------------------------------------------------
+mcp = FastMCP("device-troubleshooting-server")
 
-async def _execute_checks(
-    conn: Any,
-    ctx: dict[str, Any],
-    read_timeout: int = 60,
-    max_retries: int = 3,
-) -> dict[str, Any]:
+
+@mcp.prompt(
+    name="system_prompt",
+    description="System prompt for the device troubleshooter agent.")
+def system_prompt() -> str:
+    return """
+    You are a Network CLI Assistant
+
+    Your job is to interact with network devices by:
+      - Interpreting natural language requests
+      - Converting them into safe, read-only CLI commands
+      - Executing them using a secure tool
+      - Returning human-friendly summaries of the results
+
+    -------------------------------------------------------------
+    Device Details (provided by user):
+    {device_details}
+
+    -------------------------------------------------------------
+    Workflow:
+
+      Intent Detection:
+        - Understand the user's request (e.g., check CPU, OSPF, interface status)
+
+      System Identification:
+        - Use the device details provided by the user.
+
+      Cache Check:
+        - If (device_ip, region, command) has been executed before, return cached result.
+
+      Command Generation:
+        - Convert the request into a valid read-only CLI command.
+        - If vendor/OS is known, adjust the command format accordingly.
+
+      Execution:
+        - execute_query_on_server(device_ip: str, region: str, command: str, port: int = 22)
+
+      Output Interpretation:
+        - Summarize CLI output in clear, user-friendly language.
+
+      Session Management:
+        - Retain session state for follow-up queries.
+        - Use 'logout' to clear session context.
+
+    -------------------------------------------------------------
+    Security Rules:
+      Only execute read-only commands: show, ping, traceroute
+      Never run configuration or destructive commands: configure terminal, reload, set, etc.
     """
-    Execute all checks for a device and return result dict.
-    Mirrors DeviceHelper.execute_show_commands().
-    """
-    result_dict: dict[str, Any] = {}
-    checks = ctx["checks"]["commands"] or {}
-    brand_category = ctx["brand_category"]
-    host_group = ctx.get("host_group")
-    network_command_executer = NetworkFactory.get_network_brand_object(brand_category)
-
-    for each_check, command in checks.items():
-        cmd = command["command"]
-        cmd_pattern = command["pattern"]
-        check_overrides = None
-
-        if host_group is not None:
-            check_overrides = host_group.checks_override.get(each_check)
-            if check_overrides is not None:
-                cmd = check_overrides.get_command_str(cmd)
-
-        commands_list = [c.strip() for c in cmd.split(",") if c.strip()]
-        last_error = None
-
-        for attempt in range(max_retries):
-            try:
-                if len(commands_list) == 1:
-                    raw_output = await _run_command(
-                        conn,
-                        commands_list[0],
-                        timeout=read_timeout,
-                    )
-                else:
-                    raw_output = await _run_multiline_commands(
-                        conn,
-                        commands_list,
-                        timeout=read_timeout,
-                    )
-
-                if "override_" in (brand_category or ""):
-                    status, output = _unpack_parser_result(
-                        network_command_executer(
-                            ctx["device_type"],
-                            each_check,
-                            raw_output,
-                            cmd_pattern,
-                            ctx["dashboard"],
-                            brand_category,
-                        ),
-                        ctx,
-                        each_check,
-                        raw_output,
-                    )
-                else:
-                    if check_overrides is not None:
-                        if check_overrides.parser_func_override is not None:
-                            status, output = _unpack_parser_result(
-                                check_overrides.parser_func_override(),
-                                ctx,
-                                each_check,
-                                raw_output,
-                            )
-                        elif check_overrides.args_override is not None:
-                            status, output = _unpack_parser_result(
-                                network_command_executer(
-                                    each_check,
-                                    raw_output,
-                                    cmd_pattern,
-                                    check_overrides.args_override,
-                                ),
-                                ctx,
-                                each_check,
-                                raw_output,
-                            )
-                        else:
-                            status, output = _unpack_parser_result(
-                                network_command_executer(
-                                    each_check,
-                                    raw_output,
-                                    cmd_pattern,
-                                ),
-                                ctx,
-                                each_check,
-                                raw_output,
-                            )
-                    else:
-                        status, output = _unpack_parser_result(
-                            network_command_executer(
-                                each_check,
-                                raw_output,
-                                cmd_pattern,
-                            ),
-                            ctx,
-                            each_check,
-                            raw_output,
-                        )
-
-                check_key = each_check if each_check != "Link Status" else "Interface Status"
-                result_dict[check_key] = {
-                    "status": status,
-                    "output": str(output) if output is not None else None,
-                    "err": None,
-                }
-                logger.info(
-                    f"[{ctx['device_ip']}] Check '{each_check}' -> {status}"
-                )
-                break
-
-            except asyncio.TimeoutError:
-                last_error = f"Timeout after {read_timeout}s"
-                logger.warning(
-                    f"[{ctx['device_ip']}] Timeout on '{each_check}' "
-                    f"attempt {attempt + 1}"
-                )
-            except EOFError:
-                last_error = "EOFError: connection dropped"
-                logger.warning(
-                    f"[{ctx['device_ip']}] EOFError on '{each_check}' "
-                    f"attempt {attempt + 1}"
-                )
-                break
-            except Exception as ex:
-                last_error = str(ex)
-                logger.warning(
-                    f"[{ctx['device_ip']}] Error on '{each_check}' "
-                    f"attempt {attempt + 1}: {ex}"
-                )
-
-        else:
-            check_key = each_check if each_check != "Link Status" else "Interface Status"
-            result_dict[check_key] = {
-                "status": HealthStatus.FAIL.value,
-                "output": None,
-                "err": last_error,
-            }
-
-    result_dict["Ping Status"] = {
-        "status": "REACHABLE",
-        "output": None,
-        "err": None,
-    }
-    return result_dict
 
 
-# ---------------------------------------------------------------------------
-# Result builders
-# ---------------------------------------------------------------------------
+import socket
+from paramiko import SSHClient, AutoAddPolicy
+from paramiko.ssh_exception import AuthenticationException, SSHException
+import logging
+import time
 
-def _build_device_result(
-    ctx: dict[str, Any],
-    result_dict: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "device_name": ctx["device_name"],
-        "device_ip": ctx["device_ip"],
-        "assert_id": ctx.get("assert_id"),
-        "dashboard": ctx.get("dashboard"),
-        "port": ctx["port"],
-        "brand_model": ctx.get("brand_model"),
-        "infra_name": ctx.get("infra_name"),
-        "infra_type": ctx.get("infra_type"),
-        "device_json_data": {ctx["device_name"]: result_dict},
-    }
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
 
-def _build_unreachable_result(
-    ctx: dict[str, Any],
-    reason: str,
-) -> dict[str, Any]:
-    checks = ctx["checks"]["commands"] or {}
-    result_dict: dict[str, Any] = {}
-
-    for each_check in checks:
-        result_dict[each_check] = {
-            "status": HealthStatus.NOTCONNECTED.value,
-            "output": None,
-            "err": reason,
-        }
-
-    result_dict["Ping Status"] = {
-        "status": "NOTREACHABLE",
-        "output": None,
-        "err": reason,
-    }
-    return _build_device_result(ctx, result_dict)
+class BastionError(Exception):
+    pass
 
 
-def _build_only_ping_result(ctx: dict[str, Any]) -> dict[str, Any]:
-    return _build_device_result(
-        ctx,
-        {"Ping Status": {"status": "REACHABLE", "output": None, "err": None}},
-    )
+class Bastion:
+    def __init__(self, region, timeout=15, keepalive=30):
+        self.host = Settings.SSH_JUMPHOST_DETAILS[region]["IP"]
+        self.user = Settings.SSH_JUMPHOST_DETAILS[region]["USERNAME"]
+        self.key = Settings.SSH_JUMPHOST_DETAILS[region]["KEY_PATH"]
+        self.port = Settings.SSH_JUMPHOST_DETAILS[region].get("PORT", 22)
+        self.region = region
+        self.password = None
+        self.timeout = timeout
+        self.keepalive = keepalive
+        self.client: SSHClient | None = None
 
-
-# ---------------------------------------------------------------------------
-# Per-device worker
-# ---------------------------------------------------------------------------
-
-async def _device_worker(
-    ctx: dict[str, Any],
-    bastion_conn: asyncssh.SSHClientConnection,
-    semaphore: asyncio.Semaphore,
-    connect_timeout: int,
-    read_timeout: int,
-) -> dict[str, Any]:
-    async with semaphore:
-        device_ip = ctx["device_ip"]
-        device_name = ctx["device_name"]
-
-        # 1) Ping check via bastion.
-        ping_ok = await _ping_via_bastion(bastion_conn, device_ip)
-        if not ping_ok:
-            logger.warning(f"[{device_ip}] Device not reachable (ping failed)")
-            return _build_unreachable_result(ctx, "Device not reachable")
-
-        # 2) Only-ping devices.
-        if ctx["only_ping_check"]:
-            logger.info(f"[{device_ip}] Only ping check configured")
-            return _build_only_ping_result(ctx)
-
-        # 3) SSH connect via bastion tunnel.
-        device_conn: Any | None = None
+    def open(self):
         try:
-            # Important: do not wrap _connect_device() in wait_for(connect_timeout).
-            # _connect_device() includes SSH auth, banner handling, and terminal setup.
-            # Wrapping the whole flow can create false "SSH connection timeout" errors.
-            device_conn = await _connect_device(
-                bastion_conn,
-                ctx,
-                connect_timeout,
+            c = SSHClient()
+            c.set_missing_host_key_policy(AutoAddPolicy())
+            c.connect(
+                hostname=self.host,
+                port=self.port,
+                username=self.user,
+                key_filename=self.key,
+                password=self.password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=self.timeout,
             )
-            logger.info(f"[{device_ip}] SSH connected")
-        except asyncio.TimeoutError:
-            logger.error(f"[{device_ip}] SSH connect timeout")
-            return _build_unreachable_result(ctx, "SSH connection timeout")
-        except asyncssh.DisconnectError as ex:
-            logger.error(f"[{device_ip}] SSH disconnect: {ex}")
-            return _build_unreachable_result(ctx, f"SSH disconnect: {ex}")
-        except Exception as ex:
-            logger.error(
-                f"[{device_ip}] SSH connect error: {ex}\n{format_exc()}"
-            )
-            return _build_unreachable_result(ctx, f"SSH error: {ex}")
+            c.get_transport().set_keepalive(self.keepalive)
+            self.client = c
+        except (AuthenticationException, SSHException,
+                socket.timeout, OSError) as e:
+            self.close()
+            raise BastionError(f"Failed to connect bastion: {e}")
 
-        # 4) Execute checks.
+    def open_channel(self, target_host, target_port=22):
+        if not self.client:
+            raise BastionError("Bastion not opened")
+        transport = self.client.get_transport()
+        dest = (target_host, target_port)
+        src = (self.host, 0)
+        return transport.open_channel("direct-tcpip", dest, src)
+
+    def close(self):
         try:
-            result_dict = await _execute_checks(
-                device_conn,
-                ctx,
-                read_timeout=read_timeout,
-            )
-            logger.info(f"[{device_name}] All checks done")
-            return _build_device_result(ctx, result_dict)
-        except Exception as ex:
-            logger.error(
-                f"[{device_ip}] Unexpected error during checks: "
-                f"{ex}\n{format_exc()}"
-            )
-            return _build_unreachable_result(ctx, f"Unexpected error: {ex}")
+            if self.client:
+                self.client.close()
         finally:
+            self.client = None
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, *_):
+        self.close()
+        return False
+
+
+def _run_composite_sequence(
+    client: SSHClient,
+    parts: list[str],
+    per_cmd_wait: float = 0.3,
+    read_window: float = 1.5,
+) -> dict:
+    """
+    Execute a sequence of commands in a single interactive shell.
+    ignore_output_for: set of command strings whose output should be discarded
+    (case-insensitive). Example: {'bash','exit'}
+    """
+    ignore_output_for = {"bash", "exit"}   # default ignore list
+    norm_ignore = {c.lower().strip() for c in ignore_output_for}
+
+    shell = client.invoke_shell()
+    kept_chunks: list[str] = []
+    try:
+        for part in parts:
+            cmd_sent = part.strip()
+            shell.send(part + '\n')
+            time.sleep(per_cmd_wait)
+            end = time.time() + read_window
+            chunk = ''
+            while time.time() < end:
+                while shell.recv_ready():
+                    chunk += shell.recv(4096).decode(errors='ignore')
+                time.sleep(0.05)
+            if cmd_sent.lower() not in norm_ignore:
+                kept_chunks.append(chunk)
+        if parts[-1].strip().lower() != 'exit':
+            shell.send('exit\n')
+            time.sleep(0.2)
+            exit_chunk = ''
+            while shell.recv_ready():
+                exit_chunk += shell.recv(4096).decode(errors='ignore')
+            if 'exit' not in norm_ignore:
+                kept_chunks.append(exit_chunk)
+        rc = 0
+    except Exception as e:
+        kept_chunks.append(f"[COMPOSITE_ERROR] {e}")
+        rc = -1
+    finally:
+        try:
+            shell.close()
+        except Exception:
+            pass
+    return {
+        "stdout": ''.join(kept_chunks),
+        "stderr": "",
+        "rc": rc,
+    }
+
+
+@mcp.tool(
+    name='execute_query_on_server',
+    description='This tool execute read only commands on the networking device',
+)
+def execute_query_on_server(
+    device_ip: Annotated[str, Field(description="IP address of the device")],
+    commands: Annotated[list, Field(description="list of command to execute on the device")],
+    region: Annotated[Literal['PARIS', 'ASIA', 'AMER', 'UK', 'INDIA', 'IBFS'],
+                      Field(description="Region device belongs to")],
+    port: Annotated[int, Field(description='port of the device', default=22)] = 22,
+):
+    """
+    device = { 'host': 'x.x.x.x', 'user': 'username',
+               'password': 'pwd' | 'key': 'path', 'port': 22 }
+    """
+    region = region.lower()
+    channel = None
+    client = SSHClient()
+    client.set_missing_host_key_policy(AutoAddPolicy())
+    try:
+        with Bastion(region.lower()) as bastion:
+            channel = bastion.open_channel(device_ip, port)
+            client.connect(
+                hostname=device_ip,
+                port=port,
+                username=Settings.DEVICE_DETAILS_SSH[bastion.region]["username"],
+                password=Settings.DEVICE_DETAILS_SSH[bastion.region]["password"],
+                key_filename=None,
+                sock=channel,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=30,
+            )
+            results = []
+            for cmd in commands:
+                if isinstance(cmd, str) and '**' in cmd:
+                    parts = [p for p in cmd.split('**') if p.strip()]
+                    composite_res = _run_composite_sequence(client, parts)
+                    results.append({
+                        "cmd": cmd,
+                        "stdout": composite_res["stdout"],
+                        "stderr": composite_res["stderr"],
+                        "rc": composite_res["rc"],
+                    })
+                else:
+                    stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+                    out = stdout.read().decode(errors="ignore")
+                    err = stderr.read().decode(errors="ignore")
+                    rc = stdout.channel.recv_exit_status()
+                    results.append({
+                        "cmd": cmd,
+                        "stdout": out,
+                        "stderr": err,
+                        "rc": rc,
+                    })
+            return results
+    except Exception as e:
+        return {"host": device_ip, "ok": False, "error": str(e)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        if channel:
             try:
-                if device_conn is not None:
-                    device_conn.close()
-                    await device_conn.wait_closed()
+                channel.close()
             except Exception:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Public entry-point
-# ---------------------------------------------------------------------------
-
-async def run_framan_dashboard(
-    dashboards: list[str],
-    connect_timeout: int = 15,
-    read_timeout: int = 60,
-    device_concurrency: int = 20,
-    # device filter options
-    device_names: Optional[list[str]] = None,
-    device_ips: Optional[list[str]] = None,
-    device_name_regex: Optional[str] = None,
-    exclude_names: Optional[list[str]] = None,
-    exclude_ips: Optional[list[str]] = None,
-) -> list[dict[str, Any]]:
-    """
-    Async equivalent of NornirHelper.get_health_status_check() for fra/man dashboards.
-
-    Flow:
-      1. Load inventory from DB
-      2. Ping each device via bastion
-      3. SSH tunnel through bastion
-      4. Execute show commands
-      5. Return list of device payloads
-    """
-
-    # Load inventory/config.
-    device_dashboard_config = get_device_dashboard_config()
-    brand_model_with_checks = remove_pinged_check_brand_model(device_dashboard_config)
-    device_brand_config = NornirDal.get_device_barand_model_config()
-    device_dashboard_override = get_device_override_config()
-    brand_model_config = get_brand_model_pattern_config(device_brand_config)
-    commands_dict = get_brand_models_commands(brand_model_with_checks, brand_model_config)
-    list_of_devices = NornirDal.get_all_devices(dashboards)
-
-    # Optional filtering.
-    before = len(list_of_devices)
-    list_of_devices = _filter_devices(
-        list_of_devices,
-        device_names=device_names,
-        device_ips=device_ips,
-        device_name_regex=device_name_regex,
-        exclude_names=exclude_names,
-        exclude_ips=exclude_ips,
-    )
-    after = len(list_of_devices)
-
-    if device_names or device_ips or device_name_regex or exclude_names or exclude_ips:
-        logger.info(
-            f"Device filter applied: {before} -> {after} devices "
-            f"(names={device_names}, ips={device_ips}, "
-            f"regex={device_name_regex}, "
-            f"exclude_names={exclude_names}, exclude_ips={exclude_ips})"
-        )
-
-    logger.info(
-        f"Loaded {len(list_of_devices)} devices for dashboards: {dashboards}"
-    )
-
-    # Group devices by region.
-    region_device_map: dict[str, list[dict[str, Any]]] = {}
-
-    for device in list_of_devices:
-        device_brand_checks_list = (
-            device_dashboard_config
-            .get(device.dashboard, {})
-            .get(device.infra_type, {})
-            .get(device.infra_name, {})
-            .get(device.brand_model)
-        )
-        device_brand_region = (
-            device_dashboard_config
-            .get(device.dashboard, {})
-            .get(device.infra_type, {})
-            .get(device.infra_name, {})
-            .get("region")
-        )
-
-        if not device_brand_region:
-            logger.warning(
-                f"No region found for device {device.device_name}, skipping"
-            )
-            continue
-
-        ctx = _build_device_context(
-            device,
-            commands_dict,
-            device_brand_checks_list,
-            device_dashboard_override,
-            device_brand_region,
-        )
-        region_device_map.setdefault(device_brand_region, []).append(ctx)
-
-    all_results: list[dict[str, Any]] = []
-
-    # Process each region (one bastion connection per region).
-    for region, device_contexts in region_device_map.items():
-        bastion_host = Settings.DEVICE_CREDENTIALS[region]["JUMPHOST_IP"]
-        bastion_user = Settings.DEVICE_CREDENTIALS[region]["JUMPHOST_USER"]
-        bastion_port = int(Settings.DEVICE_CREDENTIALS[region].get("JUMPHOST_PORT", 22))
-        bastion_key = (
-            Settings.DEVICE_CREDENTIALS[region].get("KEY_PATH")
-            or Settings.DEVICE_RSA_FILE
-        )
-
-        logger.info(
-            f"Connecting to bastion [{region}] {bastion_host}:{bastion_port} "
-            f"for {len(device_contexts)} devices"
-        )
-
-        try:
-            async with asyncssh.connect(
-                host=bastion_host,
-                port=bastion_port,
-                username=bastion_user,
-                client_keys=[bastion_key],
-                known_hosts=None,
-                connect_timeout=connect_timeout,
-            ) as bastion_conn:
-
-                semaphore = asyncio.Semaphore(device_concurrency)
-
-                tasks = [
-                    _device_worker(
-                        ctx,
-                        bastion_conn,
-                        semaphore,
-                        connect_timeout,
-                        read_timeout,
-                    )
-                    for ctx in device_contexts
-                ]
-
-                region_results = await asyncio.gather(
-                    *tasks,
-                    return_exceptions=False,
-                )
-                all_results.extend(region_results)
-
-        except Exception as ex:
-            logger.error(
-                f"Failed to connect to bastion for region {region}: "
-                f"{ex}\n{format_exc()}"
-            )
-            for ctx in device_contexts:
-                all_results.append(
-                    _build_unreachable_result(
-                        ctx,
-                        f"Jumphost not reachable: {ex}",
-                    )
-                )
-
-    logger.info(
-        f"Fra/Man dashboard complete. "
-        f"Total devices processed: {len(all_results)}"
-    )
-    return all_results
+if __name__ == "__main__":
+    print('nemo Server Started...')
+    mcp.run(transport='stdio')
 
 
-def run_framan_dashboard_sync(
-    dashboards: list[str],
-    connect_timeout: int = 15,
-    read_timeout: int = 60,
-    device_concurrency: int = 1,
-    # device filter options
-    device_names: Optional[list[str]] = None,
-    device_ips: Optional[list[str]] = None,
-    device_name_regex: Optional[str] = None,
-    exclude_names: Optional[list[str]] = None,
-    exclude_ips: Optional[list[str]] = None,
-) -> list[dict[str, Any]]:
-    return asyncio.run(
-        run_framan_dashboard(
-            dashboards=dashboards,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-            device_concurrency=device_concurrency,
-            device_names=device_names,
-            device_ips=device_ips,
-            device_name_regex=device_name_regex,
-            exclude_names=exclude_names,
-            exclude_ips=exclude_ips,
-        )
-    )
 
 
-# ---------------------------------------------------------------------------
-# Local runner
-# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# cat unicorn_server.py
+# Reconstructed from your screenshots -- verify against your original.
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated, Literal
+import requests
+from requests.adapters import HTTPAdapter
+from environs import Env
+import yaml
+
+env = Env()
+env.read_env()
+
+mcp = FastMCP("unicorn-server")
+
+
+class Settings:
+    # _basedir = os.path.abspath(os.path.dirname(__file__))
+
+    TRAP_HTTP_EXCEPTIONS = True
+    ERROR_404_HELP = True
+    BUNDLE_ERRORS = True
+
+    try:
+        with open("credentials.yml", "r") as f:
+            credentials = yaml.safe_load(f)
+    except FileNotFoundError:
+        credentials = {}
+
+    UNICORN_URLS = credentials.get("UNICORN_URLS", {})
+    UNICORN_TOKEN = credentials.get("UNICORN_TOKEN", {})
+    PROXIES = credentials.get("PROXIES", {})
+
+    SOGPT_CHAT_COMPLETION_URL = env("SOGPT_CHAT_COMPLETION_URL")
+
+    CLIENT_ID = env("CLIENT_ID")
+    CLIENT_SECRET = env("CLIENT_SECRET")
+    X_APPLICATION = env("X-APPLICATION")
+    X_KEY_NAME = env("X-KEY-NAME")
+
+    UNITY_CLIENT_ID = env("UNITY_CLIENT_ID")
+    UNITY_CLIENT_SECRET = env("UNITY_CLIENT_SECRET")
+    UNITY_SCOPE = env("UNITY_SCOPE")
+    UNITY_ENV = env("UNITY_ENV")
+
+
+@mcp.tool(
+    name="get_device_details",
+    description="""
+    This tool used to search the device details from unicorn (CMDB).
+    It give the device details based on device name and region provided by the user
+    """)
+def get_unicorn_device_details(
+    device_name: Annotated[str, Field(description="name of the device")],
+    region: Annotated[str | None, Field(
+        description="Region (PARIS, ASIA, AMER, UK, INDIA, IBFS). "
+                    "Omit or set 'AUTO' to auto-detect")] = None,
+) -> dict | str:
+    try:
+        with requests.Session() as session:
+            session.mount('https://', HTTPAdapter(max_retries=3))
+
+            def fetch(region_name: str) -> dict | None:
+                for proxy in Settings.PROXIES:
+                    try:
+                        begin, end = proxy.get("uri").split("//")
+                        proxy_info = {
+                            proxy.get("protocol"):
+                                f"{begin}//{proxy.get('login')}:{proxy.get('password')}@{end}"
+                        }
+                        url = f"{Settings.UNICORN_URLS[region_name]}/{device_name.lower()}"
+                        headers = {
+                            'Authorization': f"Token {Settings.UNICORN_TOKEN[region_name]}",
+                            'Accept': 'application/json'
+                        }
+                        response = session.get(
+                            url,
+                            verify=False,
+                            headers=headers,
+                            proxies=proxy_info if region_name not in ['ASIA', 'AMER', 'INDIA'] else None,
+                            timeout=(3, 60),
+                        )
+                        if response.status_code in (200, 201):
+                            return response.json()
+                    except Exception as ex:
+                        # Continue with next proxy or region
+                        print(f"[{region_name}] proxy attempt failed: {ex}")
+                return None
+
+            requested_region = (region or "").strip().upper()
+            if not requested_region or requested_region == "AUTO":
+                for candidate in Settings.UNICORN_URLS.keys():
+                    data = fetch(candidate)
+                    if data:
+                        return {"region": candidate, "data": data}
+                return "No data found in any region."
+            else:
+                if requested_region not in Settings.UNICORN_URLS:
+                    return (f"Invalid region '{requested_region}'. "
+                            f"Valid: {', '.join(Settings.UNICORN_URLS.keys())}")
+                data = fetch(requested_region)
+                return {"region": requested_region, "data": data} if data else "No data found!!"
+    except Exception as ex:
+        return f"Error: {str(ex)}"
+
 
 if __name__ == "__main__":
-    import json
-
-    logging.basicConfig(level=logging.INFO)
-
-    results = run_framan_dashboard_sync(
-        dashboards=["dashboard_pcn"],
-        connect_timeout=15,
-        read_timeout=60,
-        device_concurrency=10,
-        # Example: run only a few devices
-        device_names=[],
-        # Example: regex for FW devices
-        # device_name_regex=r"^PW4PFW",
-    )
-
-    print(json.dumps(results, indent=2, default=str))
+    # mcp.run(
+    #     transport="sse",
+    #     host="175.60.57.250",
+    #     port=4200,
+    #     path="/unicorn_server",
+    #     log_level="debug"
+    # )
+    mcp.run()
