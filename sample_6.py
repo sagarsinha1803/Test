@@ -243,89 +243,250 @@ if __name__ == "__main__":
 
 
 
-"""Streamlit UI for path_agent with human-in-the-loop SSH approval.
+"""Streamlit UI for path_agent -- chat-driven guided troubleshooting.
 
-    python -m pip install --user streamlit        (or: uv pip install streamlit)
-    python -m streamlit run path_ui.py            (or: uv run streamlit run path_ui.py)
+    python -m streamlit run path_ui.py      (or: uv run streamlit run path_ui.py)
 
-Needs the vscode.lm bridge on :11434 and the unicorn/ssh MCP files alongside.
-
-The graph pauses (interrupt) before every SSH command. The UI shows the pending
-action with Approve / Reject buttons, then resumes the graph.
+Left: chat (greets on open; type "troubleshoot <src> to <dst>" to start, or ask
+questions about the results). Right: Workflow Progress with an animated status
+per step; each SSH step pauses for Approve/Reject (toggle off for a smooth demo).
 """
 import asyncio
+import concurrent.futures
+import json
+import re
+import time
 import uuid
 
 import streamlit as st
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
-from path_agent import build
+import path_agent
+from path_agent import build, llm
 
-st.set_page_config(page_title="Network Troubleshooter", page_icon="🛠️")
-st.title("🛠️ Source → Dest Troubleshooter")
+# Streamlit runs its own event loop -> asyncio.run() fails inside it.
+_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def run_async(coro):
+    return _POOL.submit(asyncio.run, coro).result()
+
+
+GREETING = ("Hello. I can help with alerts, site health, incident enrichment, "
+            "runbook lookup, and source-to-destination troubleshooting.")
+
+st.set_page_config(page_title="Network Troubleshooter", page_icon="🛠️", layout="wide")
+st.title("🛠️ Network Troubleshooter")
 
 ss = st.session_state
-ss.setdefault("checkpointer", MemorySaver())   # persists across reruns in this session
+ss.setdefault("checkpointer", MemorySaver())
 ss.setdefault("thread_id", None)
-ss.setdefault("phase", "idle")                 # idle | await_approval | done
-ss.setdefault("pending", None)                 # the interrupt payload
-ss.setdefault("report", None)
+ss.setdefault("phase", "idle")          # idle | running | await_approval | done
+ss.setdefault("pending", None)
+ss.setdefault("state", {})
+ss.setdefault("chat", [("assistant", GREETING)])
+ss.setdefault("reported_thread", None)
+ss.setdefault("src", "")
+ss.setdefault("dst", "")
 
 
-async def _run(resume=None):
-    """Build the agent (fresh MCP connections) against the persisted checkpointer,
-    then start or resume the graph. Returns the resulting state."""
-    app = await build(checkpointer=ss.checkpointer)
-    config = {"configurable": {"thread_id": ss.thread_id}}
+# NOTE: no st.session_state access here -- this runs in a worker thread.
+async def _run(checkpointer, thread_id, source, dest, resume=None):
+    app = await build(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": thread_id}}
     if resume is None:
-        return await app.ainvoke({"source": ss.src, "dest": ss.dst}, config)
+        return await app.ainvoke({"source": source, "dest": dest}, config)
     return await app.ainvoke(Command(resume=resume), config)
 
 
 def _apply(state):
+    ss.state = {k: v for k, v in state.items() if k != "__interrupt__"}
     if "__interrupt__" in state:
         ss.pending = state["__interrupt__"][0].value
         ss.phase = "await_approval"
     else:
-        ss.report = state.get("report", "(no report)")
         ss.pending = None
         ss.phase = "done"
+        rep = ss.state.get("report")
+        if rep and ss.reported_thread != ss.thread_id:
+            ss.chat.append(("assistant", rep))
+            ss.reported_thread = ss.thread_id
 
 
-# ---- input form -------------------------------------------------------------
-with st.form("inputs"):
-    c1, c2 = st.columns(2)
-    src = c1.text_input("Source IP / device", "10.10.1.20")
-    dst = c2.text_input("Destination IP / device", "172.20.5.10")
-    run = st.form_submit_button("Run troubleshooting")
-
-if run:
+def start_run(src, dst):
     ss.src, ss.dst = src, dst
-    ss.thread_id = str(uuid.uuid4())     # fresh run
+    ss.thread_id = str(uuid.uuid4())
     ss.checkpointer = MemorySaver()
-    ss.report = None
-    _apply(asyncio.run(_run()))
+    ss.state = {}
+    ss.phase = "running"
+    ss.animate = True
+    _apply(run_async(_run(ss.checkpointer, ss.thread_id, src, dst)))
 
-# ---- approval gate ----------------------------------------------------------
-if ss.phase == "await_approval" and ss.pending:
-    p = ss.pending
-    st.warning("SSH action needs approval before it runs on the device.")
-    st.code(f"device_ip : {p['device_ip']}\n"
-            f"region    : {p['region']}\n"
-            f"command   : {p['command']}", language="text")
-    a, r = st.columns(2)
-    if a.button("✅ Approve", use_container_width=True):
-        _apply(asyncio.run(_run(resume=True)))
-        st.rerun()
-    if r.button("❌ Reject", use_container_width=True):
-        _apply(asyncio.run(_run(resume=False)))
+
+def resume_run(decision):
+    ss.animate = True
+    _apply(run_async(_run(ss.checkpointer, ss.thread_id, ss.src, ss.dst, resume=decision)))
+
+
+def parse_troubleshoot(text):
+    m = re.search(r'([\w.\-]+)\s+to\s+([\w.\-]+)', text, re.I)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def stream_words(text):
+    for word in text.split(" "):
+        yield word + " "
+        time.sleep(0.015)
+
+
+_ICON = {"complete": "✅", "error": "❌", "pending": "⚪",
+         "skipped": "➖", "await": "🕒", "running": "🔄"}
+
+
+def workflow_steps():
+    s, phase, p = ss.state, ss.phase, ss.pending or {}
+    cmd = p.get("command", "")
+    out = []
+
+    if s.get("cmdb"):
+        bad = "No data" in str(s["cmdb"].get("source", ""))
+        out.append(("error" if bad else "complete", "CMDB lookup",
+                    f"region {s.get('src_region') or '?'} — source & destination identified"))
+    else:
+        out.append(("running" if phase == "running" else "pending", "CMDB lookup", ""))
+
+    if "ping_raw" in s:
+        ok = s.get("ping_ok")
+        out.append(("complete" if ok else "error", "Basic reachability (ping)",
+                    "Ping result: " + ("Reachable" if ok else "Failed")))
+    elif phase == "await_approval" and "ping " in cmd:
+        out.append(("await", "Basic reachability (ping)", "awaiting approval"))
+    else:
+        out.append(("pending", "Basic reachability (ping)", ""))
+
+    if s.get("ping_ok") is True:
+        out.append(("skipped", "Traceroute / path discovery", "skipped (ping OK)"))
+    elif "traceroute_raw" in s:
+        n = len(s.get("hops") or [])
+        fh = s.get("failed_hop")
+        out.append(("complete", "Traceroute / path discovery",
+                    f"{n} hops" + (f", stops after {fh}" if fh else "")))
+    elif phase == "await_approval" and "traceroute" in cmd:
+        out.append(("await", "Traceroute / path discovery", "awaiting approval"))
+    else:
+        out.append(("pending", "Traceroute / path discovery", ""))
+
+    out.append(("complete" if s.get("report") else "pending", "Recommendation", ""))
+    return out
+
+
+def render_progress(animate=False):
+    for status, label, detail in workflow_steps():
+        ph = st.empty()
+        if animate and status in ("complete", "error", "skipped"):
+            ph.markdown(f"🔄 **{label}**")
+            time.sleep(0.6)
+        line = f"{_ICON[status]} **{label}**"
+        if detail:
+            line += f"  \n&nbsp;&nbsp;&nbsp;{detail}"
+        ph.markdown(line)
+
+
+def agent_reply():
+    have_data = bool(ss.state.get("cmdb"))
+    evidence = {k: ss.state.get(k) for k in
+                ("source", "dest", "src_region", "cmdb", "ping_ok", "ping_raw",
+                 "hops", "failed_hop", "traceroute_raw", "report")}
+    system = (
+        "You are a Network Operations troubleshooting assistant. You help with "
+        "source-to-destination reachability. To run a check, tell the user to type "
+        "'troubleshoot <source> to <destination>' (e.g. troubleshoot 10.10.1.20 to "
+        "172.20.5.10). Be concise and friendly. Plain text, no LaTeX, no $.\n\n"
+        + ("Current troubleshooting evidence (answer questions from it):\n"
+           + json.dumps(evidence, indent=2, default=str)
+           if have_data else "No troubleshooting has been run yet this session.")
+    )
+    msgs = [("system", system)]
+    for role, text in ss.chat[-12:]:
+        msgs.append(("assistant" if role == "assistant" else "user", text))
+    return llm.invoke(msgs).content
+
+
+# ============================ LAYOUT =========================================
+chat_col, work_col = st.columns([1.3, 1], gap="large")
+
+# ---- LEFT: chat (static render + capture input) ----------------------------
+with chat_col:
+    st.subheader("Assistant Chat")
+    msg_area = st.container()
+    with msg_area:
+        for role, text in ss.chat:
+            st.chat_message(role).write(text)
+    with st.form("chat_form", clear_on_submit=True):
+        chat_msg = st.text_input("Message",
+                                 placeholder="troubleshoot 10.10.1.20 to 172.20.5.10",
+                                 label_visibility="collapsed")
+        chat_sent = st.form_submit_button("Send", type="primary")
+
+# ---- RIGHT: guided troubleshooting + animated progress ---------------------
+with work_col:
+    st.subheader("Guided Troubleshooting")
+    path_agent.REQUIRE_APPROVAL = st.checkbox(
+        "Require SSH approval (uncheck for a smooth end-to-end demo)", value=True)
+    with st.form("inputs"):
+        f_src = st.text_input("Source IP / device", "10.10.1.20")
+        f_dst = st.text_input("Destination IP / device", "172.20.5.10")
+        f_run = st.form_submit_button("Run troubleshooting", type="primary")
+    if f_run:
+        start_run(f_src, f_dst)
         st.rerun()
 
-# ---- final report -----------------------------------------------------------
-if ss.phase == "done" and ss.report:
-    st.subheader("Troubleshooting Report")
-    st.text(ss.report)
+    if ss.phase in ("running", "await_approval", "done"):
+        st.markdown("**Workflow Progress**")
+        render_progress(animate=ss.pop("animate", False))
+
+    if ss.phase == "await_approval" and ss.pending:
+        p = ss.pending
+        st.warning("SSH action needs approval before it runs on the device.")
+        st.code(f"device_ip : {p['device_ip']}\n"
+                f"region    : {p['region']}\n"
+                f"command   : {p['command']}", language="text")
+        a, r = st.columns(2)
+        if a.button("✅ Approve", use_container_width=True):
+            resume_run(True)
+            st.rerun()
+        if r.button("❌ Reject", use_container_width=True):
+            resume_run(False)
+            st.rerun()
+
+    if ss.phase == "done" and ss.state.get("report"):
+        st.markdown("**Troubleshooting Report**")
+        st.text(ss.state["report"])
+
+# ---- handle chat submit AFTER both columns are drawn -----------------------
+if chat_sent and chat_msg.strip():
+    with msg_area:
+        st.chat_message("user").write(chat_msg)
+    ss.chat.append(("user", chat_msg))
+    parsed = parse_troubleshoot(chat_msg)
+    if parsed:
+        src, dst = parsed
+        note = (f"Starting troubleshooting {src} → {dst}. "
+                "Approve each SSH step on the right.")
+        with msg_area:
+            st.chat_message("assistant").write(note)
+        ss.chat.append(("assistant", note))
+        start_run(src, dst)
+        st.rerun()
+    else:
+        with msg_area:
+            with st.chat_message("assistant"):
+                with st.spinner("thinking..."):
+                    reply = agent_reply()
+                st.write_stream(stream_words(reply))
+        ss.chat.append(("assistant", reply))
+
 
 
 
