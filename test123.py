@@ -173,7 +173,6 @@ if __name__ == "__main__":
 
 
 
-
 """ClipboardLLM -- a human-relay "LLM" for when no API is available.
 
 Each call copies the rendered prompt to the clipboard and blocks. You paste it
@@ -274,17 +273,48 @@ def _system_of(messages: Sequence[BaseMessage]) -> str:
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 
+_SMART = {
+    "“": '"', "”": '"', "„": '"', "‟": '"',   # curly doubles
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",   # curly singles
+    " ": " ", "​": "", "–": "-", "—": "-",    # nbsp/zwsp/dashes
+}
+
+
 def _extract_json(text: str) -> Optional[dict]:
-    """Pull the first JSON object out of the reply (tolerates ``` fences/prose)."""
-    cleaned = re.sub(r"^\s*```(?:json)?|```\s*$", "", text.strip(), flags=re.M)
+    """Pull the first JSON object out of the reply.
+
+    Copilot renders typographic quotes, so a straight json.loads on a copied
+    answer fails; normalise those (and nbsp/zero-width) before parsing.
+    Tolerates ``` fences and surrounding prose.
+    """
+    cleaned = text.strip()
+    for bad, good in _SMART.items():
+        cleaned = cleaned.replace(bad, good)
+    cleaned = re.sub(r"^\s*```(?:json)?|```\s*$", "", cleaned, flags=re.M)
+
     m = _JSON_RE.search(cleaned)
     if not m:
         return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    candidate = m.group(0)
+    # copying from rendered markdown puts real newlines inside string values,
+    # which json.loads rejects -> collapse them and retry.
+    flat = re.sub(r"\s*\n\s*", " ", candidate)
+
+    for attempt in (candidate, flat):
+        try:
+            obj = json.loads(attempt)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        try:                                   # trailing commas / single quotes
+            import ast
+            obj = ast.literal_eval(attempt)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return None
 
 
 def _tool_block(schemas: List[dict]) -> str:
@@ -529,7 +559,6 @@ if __name__ == "__main__":                      # python clipboard_llm.py [modul
     _copy(text)
     print(text)
     print(f"\n[{len(text)} chars -> {out}, also on the clipboard]")
-
 
 
 
