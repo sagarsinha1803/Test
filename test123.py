@@ -444,11 +444,20 @@ class ClipboardLLM(BaseChatModel):
         elif "tool" in obj:
             calls = [obj]
 
+        def _clean(v):
+            """Drop markdown escaping from names/keys (Copilot writes get\\_x)."""
+            if isinstance(v, str):
+                return v.replace("\\", "")
+            if isinstance(v, dict):
+                return {str(k).replace("\\", ""): _clean(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_clean(x) for x in v]
+            return v
+
         if calls:
             tool_calls = [{
-                # strip any stray markdown escaping left in the name
                 "name": str(c.get("tool") or c.get("name")).replace("\\", "").strip(),
-                "args": c.get("args") or c.get("arguments") or {},
+                "args": _clean(c.get("args") or c.get("arguments") or {}),
                 "id": "call_" + uuid.uuid4().hex[:12],
                 "type": "tool_call",
             } for c in calls if (c.get("tool") or c.get("name"))]
@@ -576,9 +585,7 @@ if __name__ == "__main__":                      # python clipboard_llm.py [modul
 
 
 
-
-
-"""Streamlit UI for the agentic network troubleshooter (net_agent.py).
+""""Streamlit UI for the agentic network troubleshooter (net_agent.py).
 
 Chat drives it: "troubleshoot 10.10.1.20 to 172.20.5.10". The agent decides the
 per-vendor commands itself; every device command needs approval here first.
@@ -587,6 +594,7 @@ per-vendor commands itself; every device command needs approval here first.
 """
 import asyncio
 import concurrent.futures
+import time
 import uuid
 
 import streamlit as st
@@ -616,6 +624,14 @@ ss.setdefault("thread_id", str(uuid.uuid4()))
 ss.setdefault("trace", [("assistant", GREETING)])   # [(kind, text)]
 ss.setdefault("pending", None)
 ss.setdefault("seen", 0)                           # messages already rendered
+ss.setdefault("streamed", 0)                       # trace entries already streamed
+
+
+def stream_words(text, delay=0.012):
+    """Yield the text word by word so st.write_stream renders it progressively."""
+    for word in str(text).split(" "):
+        yield word + " "
+        time.sleep(delay)
 
 CLIP = getattr(net_agent, "LLM_MODE", "") == "clipboard"
 
@@ -653,15 +669,22 @@ def _absorb(state):
                  ("ping_ok", "hops", "path", "commands_run", "devices", "loops")}
 
 
-def render(kind, text):
+def render(kind, text, stream=False):
     if kind == "user":
         st.chat_message("user").write(text)
     elif kind == "assistant":
-        st.chat_message("assistant").write(text)
+        with st.chat_message("assistant"):
+            if stream:
+                st.write_stream(stream_words(text))
+            else:
+                st.write(text)
     elif kind == "think":
         with st.chat_message("assistant"):
             with st.expander("💭 reasoning", expanded=True):
-                st.markdown(text)
+                if stream:
+                    st.write_stream(stream_words(text, 0.006))
+                else:
+                    st.markdown(text)
     elif kind == "call":
         st.chat_message("assistant").info(f"🔧 {text}")
     elif kind == "tool":
@@ -676,8 +699,10 @@ with chat_col:
     if CLIP:
         st.caption("Clipboard relay — when the banner shows, paste into Copilot and "
                    "copy back its JSON reply. One paste per agent step.")
-    for kind, text in ss.trace:
-        render(kind, text)
+    # entries added since the last render stream in; older ones render instantly
+    for i, (kind, text) in enumerate(ss.trace):
+        render(kind, text, stream=(i >= ss.streamed))
+    ss.streamed = len(ss.trace)
 
     with st.form("ask", clear_on_submit=True):
         q = st.text_input("Ask", placeholder="troubleshoot 10.10.1.20 to 172.20.5.10",
@@ -722,6 +747,7 @@ with side_col:
         ss.thread_id = str(uuid.uuid4())
         ss.checkpointer = MemorySaver()
         ss.trace, ss.pending, ss.seen = [("assistant", GREETING)], None, 0
+        ss.streamed = 0
         if hasattr(net_agent.llm, "reset_conversation"):
             net_agent.llm.reset_conversation()
         st.rerun()
@@ -755,7 +781,6 @@ if approve:
     _drive(resume=True)
 if reject:
     _drive(resume=False)
-
 
 
 
@@ -878,6 +903,34 @@ def check_command(cmd: str) -> Optional[str]:
     if _BLOCKED.search(c):
         return f"'{c}' contains a state-changing keyword"
     return None
+
+
+def _tool_text(result) -> str:
+    """Flatten an MCP tool result into plain text.
+
+    MCP returns content blocks -- [{'type': 'text', 'text': '...'}] -- and a raw
+    str() of that keeps the repr escaping, which breaks both the output parsers
+    and what the model gets to read.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if "text" in result:
+            return str(result["text"])
+        return str(result)
+    if isinstance(result, (list, tuple)):
+        parts = []
+        for item in result:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            elif hasattr(item, "text"):
+                parts.append(str(item.text))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if hasattr(result, "text"):
+        return str(result.text)
+    return str(result)
 
 
 def _commands_of(args: dict) -> list:
@@ -1034,7 +1087,7 @@ async def build_agent(checkpointer=None):
                 except Exception as e:
                     result = f"error calling {name}: {e}"
 
-            text = str(result)
+            text = _tool_text(result)
             out_msgs.append(ToolMessage(content=text, name=name, tool_call_id=tid))
 
             if name in DEVICE_TOOLS:
@@ -1113,8 +1166,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
 
 
 
