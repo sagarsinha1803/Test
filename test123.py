@@ -51,6 +51,7 @@ ss.setdefault("seen", 0)                           # messages already rendered
 ss.setdefault("streamed", 0)                       # trace entries already streamed
 ss.setdefault("show_details", False)               # hide reasoning / tool calls
 ss.setdefault("busy", False)                       # a step is currently running
+ss.setdefault("decision", None)                    # approve/reject awaiting execution
 
 
 def stream_words(text, delay=0.012):
@@ -185,7 +186,16 @@ with chat_col:
 
 with side_col:
     st.subheader("Device command approval")
-    if ss.pending:
+    approve = reject = False
+    if ss.decision is not None and ss.pending:
+        # already clicked -> buttons gone, show what is happening instead
+        p = ss.pending
+        if ss.decision:
+            st.info(f"⚙️ **Running on {p.get('device_ip')} ({p.get('region')})**\n\n"
+                    f"`{p.get('command')}`")
+        else:
+            st.error(f"⛔ Rejected: `{p.get('command')}`")
+    elif ss.pending:
         p = ss.pending
         st.warning("The agent wants to run this on a device.")
         st.code(f"device_ip : {p.get('device_ip')}\n"
@@ -197,31 +207,73 @@ with side_col:
     else:
         st.caption("No command pending. Read-only commands only; each one is "
                    "validated in code and needs your approval.")
-        approve = reject = False
 
     st.checkbox("Show agent reasoning and tool calls", key="show_details",
                 help="Off = only the question and the final answer")
 
     st.divider()
     st.subheader("Workflow progress")
+    _STATE = {"done": "complete", "fail": "error", "run": "running",
+              "wait": "running", "idle": "running"}
     for status, label, detail in workflow_steps():
-        st.markdown(f"{_ICON[status]} **{label}**"
-                    + (f"  \n&nbsp;&nbsp;&nbsp;{detail}" if detail else ""))
+        if status == "idle":                       # not started -> plain, no spinner
+            st.markdown(f"⚪ {label}")
+            continue
+        with st.status(label, state=_STATE[status],
+                       expanded=bool(detail)) as box:
+            if detail:
+                st.write(detail)
+            if status == "wait":
+                box.update(label=f"{label} — awaiting your approval")
 
     st.divider()
     gs = ss.get("gstate") or {}
-    st.subheader("Graph state")
-    ping = gs.get("ping_ok")
-    st.markdown(f"**Ping:** {'✅ reachable' if ping else ('❌ failed' if ping is False else '⚪ not run')}")
-    st.markdown(f"**Hops:** {len(gs.get('hops') or [])}")
-    if gs.get("path"):
-        st.code(gs["path"], language="text")
-    if gs.get("commands_run"):
-        st.caption("Commands run")
-        for c in gs["commands_run"]:
-            st.markdown(f"{'✅' if c.get('approved') else '⛔'} `{c.get('command')}` "
-                        f"on {c.get('device_ip')}")
-    st.caption(f"tool loops: {gs.get('loops') or 0} / {net_agent.MAX_TOOL_LOOPS}")
+    finished = (not ss.pending) and ss.decision is None and not ss.busy \
+        and any(k == "assistant" for k, _ in ss.trace[1:])
+
+    if finished:
+        st.subheader("📋 Summary report")
+        ping = gs.get("ping_ok")
+        verdict = ("REACHABLE" if ping else
+                   "NOT REACHABLE / INCONCLUSIVE" if ping is False else "NOT TESTED")
+        st.markdown(f"**Question:** {ss.get('question', '-')}")
+        st.markdown(f"**Ping:** {'SUCCESS' if ping else ('FAILED' if ping is False else 'not run')}"
+                    f" — parsed independently of the model")
+        st.markdown(f"**Verdict (parsed):** {verdict}")
+        if gs.get("path"):
+            st.markdown("**Path:**")
+            st.code(gs["path"], language="text")
+        hops = gs.get("hops") or []
+        if hops:
+            st.markdown("**Hops:**")
+            st.code("\n".join(
+                f"{h['n']:>2}  " + ("* * * (no response)" if h["timeout"]
+                                    else (h.get("host") or h.get("ip") or ""))
+                for h in hops), language="text")
+        cmds = gs.get("commands_run") or []
+        if cmds:
+            st.markdown(f"**Commands run ({len(cmds)}):**")
+            for c in cmds:
+                st.markdown(f"{'✅' if c.get('approved') else '⛔'} "
+                            f"`{c.get('command')}` on {c.get('device_ip')}")
+        answers = [t for k, t in ss.trace if k == "assistant"][1:]
+        if answers:
+            with st.expander("Agent's full report", expanded=True):
+                st.text(answers[-1])
+        st.caption(f"tool loops: {gs.get('loops') or 0} / {net_agent.MAX_TOOL_LOOPS}")
+    else:
+        st.subheader("Graph state")
+        ping = gs.get("ping_ok")
+        st.markdown(f"**Ping:** {'✅ reachable' if ping else ('❌ failed' if ping is False else '⚪ not run')}")
+        st.markdown(f"**Hops:** {len(gs.get('hops') or [])}")
+        if gs.get("path"):
+            st.code(gs["path"], language="text")
+        if gs.get("commands_run"):
+            st.caption("Commands run")
+            for c in gs["commands_run"]:
+                st.markdown(f"{'✅' if c.get('approved') else '⛔'} `{c.get('command')}` "
+                            f"on {c.get('device_ip')}")
+        st.caption(f"tool loops: {gs.get('loops') or 0} / {net_agent.MAX_TOOL_LOOPS}")
 
     st.divider()
     st.caption("MCP servers")
@@ -273,10 +325,17 @@ if sent and q.strip():
     ss.seen = 0
     _drive()
 
+# click -> record + rerun so the buttons disappear immediately, THEN execute
 if approve:
-    _drive(resume=True)
+    ss.decision = True
+    st.rerun()
 if reject:
-    _drive(resume=False)
+    ss.decision = False
+    st.rerun()
+
+if ss.decision is not None:
+    d, ss.decision = ss.decision, None
+    _drive(resume=d)
 
 
 
@@ -491,10 +550,17 @@ WORKFLOW (in order, one tool call at a time):
      NetScaler/F5/Linux : ping -c 3 <dest>
      Huawei VRP / HP Comware : ping -c 3 <dest>
      MikroTik RouterOS: /ping <dest> count=3
-3. Then run the matching READ-ONLY traceroute in that platform's syntax
-   (traceroute / tracert / execute traceroute / /tool traceroute ...), bounded to
-   a few hops where supported. ALWAYS run it, even when the ping succeeded --
-   the path itself is part of the answer.
+3. Then run the matching READ-ONLY traceroute. ALWAYS BOUND IT -- an unbounded
+   traceroute probes 30 hops with 3 probes each and takes minutes. Use at most
+   5 hops, 1 probe, 1s timeout, numeric:
+     IOS-XR : traceroute <dest> maxttl 5 timeout 1 probe 1 numeric
+              (VRF: traceroute vrf <vrf> <dest> maxttl 5 timeout 1 probe 1 numeric)
+     IOS    : traceroute <dest> ttl 1 5 timeout 1 probe 1 numeric
+     Junos  : traceroute <dest> ttl 5 wait 1
+     Linux/Gaia/F5/NetScaler : traceroute -n -m 5 -w 1 -q 1 <dest>
+     Huawei/Comware : tracert -m 5 <dest>
+   ALWAYS run it, even when the ping succeeded -- the path is part of the answer.
+   If 5 hops is not enough, say so and raise it once, to 10.
 4. If the ping FAILED or the traceroute stopped early, do not stop and do not
    repeat the same command. Escalate one check at a time, stopping as soon as
    the failure is explained. Examples are Cisco IOS-XR; adapt to the platform.
@@ -1226,18 +1292,21 @@ WORKFLOW
    Note: a management IP is often on an out-of-band network and unreachable from
    another router by design. Prefer a loopback/service IP as the target when the
    record offers one, and say if you switched.
-2. Ping the destination FROM the source, using the syntax for the source's
-   platform:
-     Cisco IOS/IOS-XE: ping <dest> repeat 3     Cisco NX-OS/IOS-XR: ping <dest> count 3
-     Juniper: ping <dest> count 3               Arista: ping <dest> repeat 3
-     FortiOS: execute ping <dest>               PAN-OS: ping count 3 host <dest>
-     Check Point/NetScaler/F5/Linux/Huawei/Comware: ping -c 3 <dest>
-     MikroTik: /ping <dest> count=3
+2. Ping the destination FROM the source, in the source platform's syntax:
+     IOS/IOS-XE/Arista: ping <dest> repeat 3   NX-OS/IOS-XR/Junos: ping <dest> count 3
+     FortiOS: execute ping <dest>              PAN-OS: ping count 3 host <dest>
+     Gaia/NetScaler/F5/Linux/Huawei/Comware: ping -c 3 <dest>
    Unlisted platform: use the closest match and say which you assumed.
-3. Traceroute in the same platform's syntax, bounded where supported
-   (IOS-XR: traceroute <dest>; IOS: traceroute <dest> ttl 1 5 timeout 1 probe 1;
-   FortiOS: execute traceroute <dest>; Huawei/Comware: tracert <dest>).
-   ALWAYS run it - the path is part of the answer.
+3. Traceroute in the same platform's syntax. ALWAYS BOUND IT - an unbounded
+   traceroute probes 30 hops with 3 probes each and takes minutes. Use at most
+   5 hops, 1 probe, 1 second timeout, numeric output:
+     IOS-XR : traceroute [vrf <vrf>] <dest> maxttl 5 timeout 1 probe 1 numeric
+     IOS    : traceroute <dest> ttl 1 5 timeout 1 probe 1 numeric
+     Junos  : traceroute <dest> ttl 5 wait 1
+     Linux/Gaia/F5/NetScaler : traceroute -n -m 5 -w 1 -q 1 <dest>
+     Huawei/Comware: tracert -m 5 <dest>     FortiOS: execute traceroute <dest>
+   ALWAYS run it - the path is part of the answer. If 5 hops is not enough, say
+   so and raise it once, to 10.
 4. If the ping FAILED or the traceroute stopped early, escalate one check at a
    time and stop as soon as the failure is explained. Examples are IOS-XR.
    a. Route present?  show route <dest>        (IOS: show ip route <dest>)
@@ -1324,7 +1393,6 @@ No markdown escaping anywhere in the JSON. Include a short "thought".
 
 I will paste each result back as "Result from <function name>: ..." so you can
 decide the next step.
-
 
 
 
