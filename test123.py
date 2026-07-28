@@ -31,6 +31,17 @@ st.set_page_config(page_title="Network Troubleshooting Agent", page_icon="🛰�
                    layout="wide")
 st.title("🛰️ Network Troubleshooting Agent")
 
+# keep the right-hand panel pinned while the conversation scrolls
+st.markdown("""
+<style>
+div[data-testid="stHorizontalBlock"] > div:nth-child(2) > div {
+    position: sticky;
+    top: 3rem;
+    align-self: flex-start;
+}
+</style>
+""", unsafe_allow_html=True)
+
 ss = st.session_state
 ss.setdefault("checkpointer", MemorySaver())
 ss.setdefault("thread_id", str(uuid.uuid4()))
@@ -39,6 +50,7 @@ ss.setdefault("pending", None)
 ss.setdefault("seen", 0)                           # messages already rendered
 ss.setdefault("streamed", 0)                       # trace entries already streamed
 ss.setdefault("show_details", False)               # hide reasoning / tool calls
+ss.setdefault("busy", False)                       # a step is currently running
 
 
 def stream_words(text, delay=0.012):
@@ -106,6 +118,52 @@ def render(kind, text, stream=False):
             st.code(text, language="text")
 
 
+_ICON = {"done": "✅", "fail": "❌", "wait": "🕒", "run": "🔄", "idle": "⚪"}
+
+
+def workflow_steps():
+    """(status, label, detail) per step, derived from the trace + graph state."""
+    gs = ss.get("gstate") or {}
+    calls = [t for k, t in ss.trace if k == "call"]
+    busy = ss.get("busy")
+    lookups = [c for c in calls if "device_details" in c or "get_device" in c]
+    devcmds = [c for c in calls if "execute_query_on_server" in c]
+
+    out = []
+    if lookups:
+        out.append(("done", "CMDB lookup",
+                    f"{len(lookups)} device record(s) fetched"))
+    else:
+        out.append((("run" if busy else "idle"), "CMDB lookup", ""))
+
+    ping = gs.get("ping_ok")
+    if ping is True:
+        out.append(("done", "Reachability (ping)", "Ping result: reachable"))
+    elif ping is False:
+        out.append(("fail", "Reachability (ping)", "Ping result: failed"))
+    elif ss.pending and "ping" in str(ss.pending.get("command", "")).lower():
+        out.append(("wait", "Reachability (ping)", "awaiting your approval"))
+    else:
+        out.append((("run" if busy and devcmds else "idle"),
+                    "Reachability (ping)", ""))
+
+    hops = gs.get("hops") or []
+    if hops:
+        out.append(("done", "Path discovery", f"{len(hops)} hop(s) found"))
+    elif ss.pending and "trace" in str(ss.pending.get("command", "")).lower():
+        out.append(("wait", "Path discovery", "awaiting your approval"))
+    else:
+        out.append(("idle", "Path discovery", ""))
+
+    extra = [c for c in devcmds if "show" in c.lower()]
+    if extra:
+        out.append(("done", "Deeper checks", f"{len(extra)} show command(s) run"))
+
+    answered = any(k == "assistant" for k, _ in ss.trace[1:])
+    out.append((("done" if answered else "idle"), "Conclusion", ""))
+    return out
+
+
 chat_col, side_col = st.columns([1.4, 1], gap="large")
 
 with chat_col:
@@ -145,6 +203,12 @@ with side_col:
                 help="Off = only the question and the final answer")
 
     st.divider()
+    st.subheader("Workflow progress")
+    for status, label, detail in workflow_steps():
+        st.markdown(f"{_ICON[status]} **{label}**"
+                    + (f"  \n&nbsp;&nbsp;&nbsp;{detail}" if detail else ""))
+
+    st.divider()
     gs = ss.get("gstate") or {}
     st.subheader("Graph state")
     ping = gs.get("ping_ok")
@@ -173,18 +237,31 @@ with side_col:
 
 
 def _drive(resume=None):
-    cue = st.empty()
-    if CLIP:
+    cue, status = st.empty(), st.empty()
+    running = ss.pending if resume is True else None
+
+    if running:                       # an approved command is about to execute
+        status.info(f"⚙️ Running on {running.get('device_ip')} "
+                    f"({running.get('region')}): `{running.get('command')}` …")
+        label = "executing command on the device…"
+    elif CLIP:
         cue.warning("📋 **Prompt is on your clipboard** — paste it into Copilot, "
                     "then copy the reply.")
-    with st.spinner("waiting for clipboard…" if CLIP else "thinking…"):
+        label = "waiting for clipboard…"
+    else:
+        label = "thinking…"
+
+    ss.busy = True
+    with st.spinner(label):
         try:
             # read session_state HERE (main thread), pass values into the worker
             _absorb(run_async(_run(ss.checkpointer, ss.thread_id,
                                    ss.get("question", ""), resume)))
         except Exception as e:
             ss.trace.append(("assistant", f"error: {e}"))
+    ss.busy = False
     cue.empty()
+    status.empty()
     st.rerun()
 
 
@@ -283,7 +360,8 @@ MCP_SERVERS = {
 DEVICE_SERVERS = {"ssh"}
 
 REQUIRE_APPROVAL = True
-MAX_TOOL_LOOPS = 6            # agent<->tools round trips before we force an answer
+MAX_TOOL_LOOPS = 12           # agent<->tools round trips before we force an answer
+                              # (2 CMDB + ping + traceroute + escalation checks)
 
 # ---- LLM ---------------------------------------------------------------------
 LLM_MODE = os.environ.get("LLM_MODE", "clipboard")
@@ -309,8 +387,23 @@ _BLOCKED = re.compile(
     r"shutdown|set\s|commit|rollback|request|restart|halt|format|install)\b", re.I)
 
 
+# Commands that dump whole tables. Harmless to the device, fatal to the context
+# window (a full route table or config is hundreds of thousands of characters).
+# Allowed only when narrowed by an argument or piped through a filter.
+_BULK = re.compile(
+    r"^\s*show\s+("
+    r"run(ning-config)?|tech(-support)?|config(uration)?|logging|version\s*$|"
+    r"route\s*$|route\s+(ipv4|ipv6|vrf\s+\S+)?\s*$|"
+    r"bgp\s*$|bgp\s+(ipv4|vpnv4|vrf\s+\S+)?\s*(unicast)?\s*$|"
+    r"cef\s*$|arp\s*$|mpls\s+forwarding\s*$|"
+    r"interfaces?\s*$|ip(v4|v6)?\s+interface\s*$|"
+    r"access-lists?\s*$|vrf\s+all\s+detail"
+    r")\b", re.I)
+
+
 def check_command(cmd: str) -> Optional[str]:
-    """Return an error string if this is not a safe read-only command."""
+    """Return an error string if this is not a safe, appropriately scoped
+    read-only command."""
     c = (cmd or "").strip()
     if not c:
         return "empty command"
@@ -318,6 +411,10 @@ def check_command(cmd: str) -> Optional[str]:
         return f"'{c}' is not in the read-only allowlist (ping/traceroute/show only)"
     if _BLOCKED.search(c):
         return f"'{c}' contains a state-changing keyword"
+    if _BULK.match(c) and "|" not in c:
+        return (f"'{c}' would dump a whole table. Narrow it with a specific "
+                "prefix/interface, or filter it, e.g. "
+                "'show route 10.1.1.1' or 'show arp | include 10.1.1.1'")
     return None
 
 
@@ -398,7 +495,49 @@ WORKFLOW (in order, one tool call at a time):
    (traceroute / tracert / execute traceroute / /tool traceroute ...), bounded to
    a few hops where supported. ALWAYS run it, even when the ping succeeded --
    the path itself is part of the answer.
-4. Read the outputs and give the final answer.
+4. If the ping FAILED or the traceroute stopped early, do not stop and do not
+   repeat the same command. Escalate one check at a time, stopping as soon as
+   the failure is explained. Examples are Cisco IOS-XR; adapt to the platform.
+   a. Route present?   show route <dest>        (IOS: show ip route <dest>)
+      No route -> local routing problem, that is the answer. A route -> note the
+      next hop, the outgoing interface and any VRF.
+   b. In a VRF?        show vrf all / show route vrf <vrf> <dest>
+      then retest inside it: ping vrf <vrf> <dest>, traceroute vrf <vrf> <dest>
+      (IOS-XR may need the address family: traceroute vrf <vrf> ipv4 <dest>)
+      A SUCCESSFUL PING IS AUTHORITATIVE: if the ping succeeds in the VRF the
+      destination IS reachable, even if the traceroute returns nothing or only
+      * * *. In an MPLS L3VPN the core switches on labels and has no route back
+      into the VRF, so it cannot answer the probes -- the path is invisible, not
+      broken. Report reachable and explain that.
+   c. Wrong source?    ping <dest> source <interface>   (try egress + loopback)
+   d. Programmed?      show cef <dest>          (IOS: show ip cef <dest>)
+   e. Next hop alive?  show arp | ping <next-hop>
+   f. Interface ok?    show interface <interface> brief
+   g. Traceroute stopping early is often NORMAL: an MPLS core forwards on labels
+      and never answers probes (check: show mpls forwarding prefix <dest>), or a
+      firewall drops ICMP/UDP. Do not call the destination unreachable on
+      traceroute alone when the route exists and the ping succeeded.
+   h. Filtered?        show access-lists <acl> | include <dest>
+   i. MPLS L3VPN and the VRF traceroute is blind -> get the path via the underlay:
+        show bgp vrf <vrf> <dest> | include "Received Label|from|metric|Local"
+      "Received Label n" confirms L3VPN; the address before "(metric n)" is the
+      REMOTE PE loopback (the one after "from" is the route reflector, ignore).
+      Then trace the underlay in the GLOBAL table (no vrf keyword):
+        traceroute <remote-PE-loopback>
+      Those hops ARE the path; report them, noting the destination sits behind
+      that PE.
+   In your thought, say what each result would rule in or out.
+
+OUTPUT SIZE IS A HARD LIMIT: large CLI output cannot be returned. Always scope a
+show command to a specific prefix/interface and add a filter when it could still
+be long -- "show route 10.1.1.1", "show arp | include 10.1.1.1",
+"show interface Gi0/0/0/1 brief". Never ask for show running-config,
+show tech-support, or a bare show route / bgp / interfaces / arp / cef /
+mpls forwarding; those are rejected in code. If output is still long, re-run
+with a tighter filter, never unfiltered.
+
+5. Read the outputs and give the final answer. Use "inconclusive" rather than
+   "not reachable" when probes were blocked but the routing looks correct.
 
 FINAL ANSWER FORMAT (plain text, no LaTeX, no $):
   Source      : <name / ip> (<vendor> <os>)
@@ -605,7 +744,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
 
@@ -1109,7 +1247,114 @@ WORKFLOW (in order, one function call at a time):
      MikroTik RouterOS       : /tool traceroute <dest> count=1
    ALWAYS run the traceroute, even when the ping succeeded -- the path itself is
    part of the answer.
-5. Read the outputs and give the final answer.
+KEEPING OUTPUT SMALL -- THIS IS A HARD REQUIREMENT
+The person reading your answer cannot receive large CLI output, and a full table
+will not fit. Every show command you ask for must be narrowed BEFORE it runs:
+  - Always give a specific prefix, address or interface:
+      show route 10.1.1.1            NOT  show route
+      show interface Gi0/0/0/1 brief NOT  show interfaces
+      show mpls forwarding prefix 10.1.1.1/32   NOT  show mpls forwarding
+  - Add an output filter when the command can still be long:
+      show route vrf CUST 10.1.1.1 | include "via|Known|Routing"
+      show arp | include 10.1.1.1
+      show bgp vrf CUST 10.1.1.1 | include "Received Label|from|metric|Local"
+      show access-lists ACL-NAME | include 10.1.1.1
+    IOS-XR and IOS both support:  | include <text>   | exclude <text>   | begin <text>
+    IOS-XR also has:              | utility head -n 20
+  - NEVER ask for: show running-config, show tech-support, a bare show route,
+    a bare show bgp, a bare show interfaces, a bare show arp, a bare show cef,
+    or a bare show mpls forwarding. These are rejected in code anyway.
+  - If a result still comes back long, do not re-run it unfiltered -- re-run it
+    with a tighter filter.
+
+5. If the ping FAILED, or the traceroute stopped early, do not stop there and do
+   not repeat the same command. Escalate through the checks below, one at a
+   time, and stop as soon as you can explain the failure. Adapt the syntax to
+   the platform; the examples are Cisco IOS-XR.
+
+   a. DOES A ROUTE EXIST? This is the most useful single check -- it separates a
+      local problem from a downstream one.
+        show route <dest>                  (IOS-XR; IOS uses: show ip route <dest>)
+      - No route / "not found"  -> the source has no path at all. That is the
+        answer: routing/advertisement problem on the source side.
+      - A route exists -> note the NEXT HOP, the OUTGOING INTERFACE and whether
+        the route sits in a VRF. Use them in the checks below.
+
+   b. IS THE DESTINATION IN A VRF? A plain ping only searches the global table,
+      so a destination inside a VRF looks unreachable when it is not.
+        show vrf all                       (list the VRFs)
+        show route vrf <vrf> <dest>
+      If it is in a VRF, redo the reachability tests inside it:
+        ping vrf <vrf> <dest>
+        traceroute vrf <vrf> <dest>        (IOS-XR may need: traceroute vrf <vrf> ipv4 <dest>)
+
+      A SUCCESSFUL PING IS AUTHORITATIVE. If the ping succeeds in the VRF, the
+      destination IS reachable -- report it as reachable even when the
+      traceroute returns nothing or only * * *. In an MPLS L3VPN the core
+      routers switch the traffic on labels and have no route back into the VRF,
+      so they cannot return the TTL-exceeded messages traceroute relies on. The
+      path is invisible, not broken. Say exactly that, and do not downgrade the
+      verdict because the hops are missing.
+
+   c. IS THE PING SOURCED FROM THE RIGHT INTERFACE? The router picks a source IP
+      on its own, and that address may be filtered or not advertised back.
+        ping <dest> source <interface from step a>
+      Try the outgoing interface, and the loopback, before concluding failure.
+
+   d. IS THE FORWARDING PATH PROGRAMMED? A route can exist in software but not
+      in hardware.
+        show cef <dest>                    (IOS-XR; IOS: show ip cef <dest>)
+
+   e. IS THE NEXT HOP ALIVE? For a directly connected next hop:
+        show arp | include <next-hop>      (IOS-XR: show arp)
+        ping <next-hop>
+      If the next hop itself does not answer, the break is on that link, not at
+      the destination.
+
+   f. IS THE EGRESS INTERFACE HEALTHY?
+        show interface <interface> brief
+      Look for down/down, or high error and drop counters.
+
+   g. WHY DID THE TRACEROUTE STOP EARLY OR RETURN NOTHING? This is often NORMAL,
+      not a failure:
+        - MPLS L3VPN: the core routers switch on labels and have no route back
+          into the VRF, so they cannot answer the probes. Hops show as * * * (or
+          the traceroute returns nothing at all) while traffic passes fine.
+          Check with:  show mpls forwarding prefix <dest>
+        - A firewall or ACL silently dropping ICMP/UDP probes.
+        - Syntax: on IOS-XR a VRF traceroute may need the address family:
+          traceroute vrf <vrf> ipv4 <dest>
+      Say which of these you believe it is, and why. NEVER report the
+      destination as unreachable on the strength of traceroute alone when the
+      route exists and the ping succeeded -- in that case it is REACHABLE and
+      the path is simply not visible to traceroute.
+
+   h. IS SOMETHING FILTERING IT? If the route is fine and the next hop answers:
+        show access-lists <acl-name> | include <dest>
+
+   i. MPLS L3VPN: HOW TO GET THE PATH WHEN THE VRF TRACEROUTE IS BLIND.
+      This is the normal situation on a service-provider core, and it is how you
+      still produce a hop list. Two steps:
+        1) Find the remote PE -- the BGP next hop for the prefix:
+             show bgp vrf <vrf> <dest> | include "Received Label|from|metric|Local"
+           In that output:
+             "Received Label <n>"  -> confirms MPLS L3VPN (traffic is label
+                                      switched, so the core cannot answer probes)
+             the address before "(metric n)" -> the REMOTE PE loopback
+             the address after "from"        -> the route reflector, ignore it
+        2) Traceroute to that remote PE in the GLOBAL table (no vrf keyword):
+             traceroute <remote-PE-loopback>
+           The core does have global routes back, so this one normally works and
+           gives you the real hop-by-hop path the VPN traffic follows.
+        3) Optionally confirm the transport label:
+             show mpls forwarding prefix <remote-PE-loopback>/32
+      Report the hops from step 2 as the path, and say they are the underlay
+      path to the remote PE, with the destination sitting behind that PE.
+
+   Prefer the check that most cheaply distinguishes the remaining possibilities,
+   and say in your thought what each result would rule in or out.
+
+6. Read the outputs and give the final answer.
 
 FINAL ANSWER FORMAT (plain text, no LaTeX, no $ symbols):
   Source      : <name / ip> (<vendor> <os>)
@@ -1118,8 +1363,14 @@ FINAL ANSWER FORMAT (plain text, no LaTeX, no $ symbols):
   Path        : source -> hop1 -> hop2 -> ... -> destination
                 (if it never arrives, end at the last hop that answered and mark
                  the break, e.g. ... -> FW-DC1-EDGE-01 -> X)
-  Result      : one line, reachable / not reachable
-  Cause       : if unreachable, the most likely reason at that hop
+  Result      : one line, reachable / not reachable / inconclusive
+  Evidence    : the checks you ran and what each one showed (route present or
+                not, VRF, next hop, interface state, ACL, MPLS)
+  Cause       : the most likely reason, and where in the path it sits
+  Next step   : what a network engineer should look at next, if anything
+
+Say "inconclusive" rather than "not reachable" when the probes were blocked but
+the routing looks correct -- that is a different finding and matters.
 
 RULES:
 - READ-ONLY commands only: ping, traceroute / tracert, show / display. Never
@@ -1381,5 +1632,6 @@ def get_device_details(
 
 if __name__ == "__main__":
     mcp.run()   # stdio
+
 
 
